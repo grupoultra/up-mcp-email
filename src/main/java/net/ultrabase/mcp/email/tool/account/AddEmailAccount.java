@@ -235,11 +235,17 @@ public class AddEmailAccount extends BaseTool {
 
         try {
             String safeName = accountName.replace("@", "_at_").replace(".", "_");
-            client.storeSecret("OAUTH_ACCESS_TOKEN_" + safeName, tokens.accessToken());
-            client.storeSecret("OAUTH_REFRESH_TOKEN_" + safeName, tokens.refreshToken());
-            client.storeSecret("OAUTH_TOKEN_EXPIRY_" + safeName, tokens.expiry().toString());
-            logger.info("OAuth tokens stored securely for account '{}'", accountName);
-            return true;
+            boolean success = true;
+            success &= client.storeSecret("OAUTH_ACCESS_TOKEN_" + safeName, tokens.accessToken());
+            success &= client.storeSecret("OAUTH_REFRESH_TOKEN_" + safeName, tokens.refreshToken());
+            success &= client.storeSecret("OAUTH_TOKEN_EXPIRY_" + safeName, tokens.expiry().toString());
+
+            if (success) {
+                logger.info("OAuth tokens stored securely for account '{}'", accountName);
+            } else {
+                logger.debug("Secret Management unavailable (HTTP 405), tokens will be stored in config");
+            }
+            return success;
         } catch (Exception e) {
             logger.warn("Failed to store tokens via Secret Management: {}", e.getMessage());
             return false;
