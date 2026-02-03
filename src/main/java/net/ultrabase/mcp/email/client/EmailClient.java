@@ -1,0 +1,896 @@
+/*
+ * up-mcp-email - MCP Server for Email
+ * Copyright (c) 2024 César Obach / ultraBASE
+ *
+ * Licensed under the MIT License.
+ */
+package net.ultrabase.mcp.email.client;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import jakarta.mail.*;
+import jakarta.mail.internet.*;
+import jakarta.mail.search.*;
+import net.ultrabase.mcp.email.config.AccountConfig;
+import org.commonmark.node.Node;
+import org.commonmark.parser.Parser;
+import org.commonmark.renderer.html.HtmlRenderer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * Email client implementation using Jakarta Mail.
+ * Supports password and OAuth2 (XOAUTH2) authentication.
+ *
+ * @author César Obach
+ */
+public class EmailClient implements IEmailClient {
+
+    private static final Logger logger = LoggerFactory.getLogger(EmailClient.class);
+    private static final ObjectMapper objectMapper = new ObjectMapper()
+        .registerModule(new JavaTimeModule());
+
+    private final AccountConfig config;
+    private final Parser markdownParser;
+    private final HtmlRenderer htmlRenderer;
+
+    private Session imapSession;
+    private Session smtpSession;
+    private Store imapStore;
+
+    public EmailClient(AccountConfig config) {
+        this.config = config;
+        this.markdownParser = Parser.builder().build();
+        this.htmlRenderer = HtmlRenderer.builder().build();
+    }
+
+    @Override
+    public String getAccountName() {
+        return config.getAccountName();
+    }
+
+    @Override
+    public String getEmailAddress() {
+        return config.getEmailAddress();
+    }
+
+    @Override
+    public String getFullName() {
+        return config.getFullName();
+    }
+
+    // ==================== Connection Management ====================
+
+    private synchronized Store getImapStore() throws MessagingException {
+        if (imapStore != null && imapStore.isConnected()) {
+            return imapStore;
+        }
+
+        Properties props = new Properties();
+        props.put("mail.store.protocol", "imaps");
+        props.put("mail.imaps.host", config.getImapHost());
+        props.put("mail.imaps.port", String.valueOf(config.getImapPort()));
+        props.put("mail.imaps.ssl.enable", String.valueOf(config.isImapSsl()));
+        props.put("mail.imaps.connectiontimeout", "10000");
+        props.put("mail.imaps.timeout", "30000");
+
+        if (config.isOAuth2()) {
+            props.put("mail.imaps.auth.mechanisms", "XOAUTH2");
+            props.put("mail.imaps.sasl.enable", "true");
+            props.put("mail.imaps.sasl.mechanisms", "XOAUTH2");
+        }
+
+        imapSession = Session.getInstance(props);
+        imapStore = imapSession.getStore("imaps");
+
+        String password = config.isOAuth2()
+            ? getXOAuth2Token()
+            : config.getImapPassword();
+
+        logger.debug("Connecting to IMAP: {}:{}", config.getImapHost(), config.getImapPort());
+        imapStore.connect(config.getImapHost(), config.getImapPort(),
+            config.getImapUsername(), password);
+
+        return imapStore;
+    }
+
+    private Session getSmtpSession() {
+        if (smtpSession != null) {
+            return smtpSession;
+        }
+
+        Properties props = new Properties();
+        props.put("mail.smtp.host", config.getSmtpHost());
+        props.put("mail.smtp.port", String.valueOf(config.getSmtpPort()));
+        props.put("mail.smtp.auth", "true");
+        props.put("mail.smtp.connectiontimeout", "10000");
+        props.put("mail.smtp.timeout", "30000");
+
+        if (config.isSmtpSsl()) {
+            if (config.getSmtpPort() == 465) {
+                props.put("mail.smtp.ssl.enable", "true");
+            } else {
+                props.put("mail.smtp.starttls.enable", "true");
+                props.put("mail.smtp.starttls.required", "true");
+            }
+        }
+
+        if (config.isOAuth2()) {
+            props.put("mail.smtp.auth.mechanisms", "XOAUTH2");
+            props.put("mail.smtp.sasl.enable", "true");
+            props.put("mail.smtp.sasl.mechanisms", "XOAUTH2");
+        }
+
+        smtpSession = Session.getInstance(props);
+        return smtpSession;
+    }
+
+    private String getXOAuth2Token() {
+        // TODO: Implement OAuth2 token refresh if expired
+        // For now, return the stored access token
+        String token = config.getOauthAccessToken();
+        if (token == null || token.isEmpty()) {
+            throw new IllegalStateException("OAuth2 access token not available for account: " + config.getAccountName());
+        }
+        return token;
+    }
+
+    private Folder openFolder(String mailboxName, int mode) throws MessagingException {
+        Store store = getImapStore();
+        Folder folder = store.getFolder(mailboxName);
+        if (!folder.exists()) {
+            throw new IllegalArgumentException("Mailbox not found: " + mailboxName);
+        }
+        folder.open(mode);
+        return folder;
+    }
+
+    // ==================== Email Reading ====================
+
+    @Override
+    public CompletableFuture<JsonNode> listEmailsMetadata(String mailbox, int page, int pageSize,
+                                                           String order, String subject, String fromAddr,
+                                                           String toAddr, String since, String before) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Folder folder = openFolder(mailbox, Folder.READ_ONLY);
+                try {
+                    int totalCount = folder.getMessageCount();
+
+                    // Build search term if filters are provided
+                    SearchTerm searchTerm = buildSearchTerm(subject, fromAddr, toAddr, since, before);
+
+                    Message[] messages;
+                    if (searchTerm != null) {
+                        messages = folder.search(searchTerm);
+                    } else {
+                        messages = folder.getMessages();
+                    }
+
+                    // Sort by date
+                    boolean descending = "desc".equalsIgnoreCase(order);
+                    Arrays.sort(messages, (m1, m2) -> {
+                        try {
+                            Date d1 = m1.getReceivedDate();
+                            Date d2 = m2.getReceivedDate();
+                            if (d1 == null) d1 = new Date(0);
+                            if (d2 == null) d2 = new Date(0);
+                            return descending ? d2.compareTo(d1) : d1.compareTo(d2);
+                        } catch (MessagingException e) {
+                            return 0;
+                        }
+                    });
+
+                    // Paginate
+                    int start = (page - 1) * pageSize;
+                    int end = Math.min(start + pageSize, messages.length);
+
+                    ObjectNode result = objectMapper.createObjectNode();
+                    ArrayNode emails = result.putArray("emails");
+
+                    for (int i = start; i < end; i++) {
+                        Message msg = messages[i];
+                        emails.add(messageToMetadata(msg));
+                    }
+
+                    result.put("page", page);
+                    result.put("page_size", pageSize);
+                    result.put("total_count", totalCount);
+                    result.put("filtered_count", messages.length);
+                    result.put("has_more", end < messages.length);
+
+                    return result;
+                } finally {
+                    folder.close(false);
+                }
+            } catch (Exception e) {
+                logger.error("Failed to list emails: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to list emails: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    private SearchTerm buildSearchTerm(String subject, String from, String to, String since, String before) {
+        List<SearchTerm> terms = new ArrayList<>();
+
+        if (subject != null && !subject.isEmpty()) {
+            terms.add(new SubjectTerm(subject));
+        }
+        if (from != null && !from.isEmpty()) {
+            terms.add(new FromStringTerm(from));
+        }
+        if (to != null && !to.isEmpty()) {
+            terms.add(new RecipientStringTerm(Message.RecipientType.TO, to));
+        }
+        if (since != null && !since.isEmpty()) {
+            Date sinceDate = Date.from(Instant.parse(since));
+            terms.add(new ReceivedDateTerm(ComparisonTerm.GE, sinceDate));
+        }
+        if (before != null && !before.isEmpty()) {
+            Date beforeDate = Date.from(Instant.parse(before));
+            terms.add(new ReceivedDateTerm(ComparisonTerm.LE, beforeDate));
+        }
+
+        if (terms.isEmpty()) {
+            return null;
+        }
+        if (terms.size() == 1) {
+            return terms.get(0);
+        }
+        return new AndTerm(terms.toArray(new SearchTerm[0]));
+    }
+
+    private ObjectNode messageToMetadata(Message msg) throws MessagingException {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("email_id", String.valueOf(msg.getMessageNumber()));
+        node.put("subject", msg.getSubject());
+
+        Address[] fromAddrs = msg.getFrom();
+        if (fromAddrs != null && fromAddrs.length > 0) {
+            node.put("from", fromAddrs[0].toString());
+        }
+
+        ArrayNode recipients = node.putArray("to");
+        Address[] toAddrs = msg.getRecipients(Message.RecipientType.TO);
+        if (toAddrs != null) {
+            for (Address addr : toAddrs) {
+                recipients.add(addr.toString());
+            }
+        }
+
+        Date receivedDate = msg.getReceivedDate();
+        if (receivedDate != null) {
+            node.put("date", receivedDate.toInstant().toString());
+        }
+
+        Flags flags = msg.getFlags();
+        node.put("is_read", flags.contains(Flags.Flag.SEEN));
+        node.put("is_flagged", flags.contains(Flags.Flag.FLAGGED));
+
+        // Size estimate
+        node.put("size_bytes", msg.getSize());
+
+        return node;
+    }
+
+    @Override
+    public CompletableFuture<JsonNode> getEmailsContent(String mailbox, List<String> emailIds) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Folder folder = openFolder(mailbox, Folder.READ_ONLY);
+                try {
+                    ObjectNode result = objectMapper.createObjectNode();
+                    ArrayNode emails = result.putArray("emails");
+                    ArrayNode failed = result.putArray("failed_ids");
+
+                    for (String emailId : emailIds) {
+                        try {
+                            int msgNum = Integer.parseInt(emailId);
+                            Message msg = folder.getMessage(msgNum);
+                            emails.add(messageToContent(msg));
+                        } catch (Exception e) {
+                            failed.add(emailId);
+                            logger.warn("Failed to get email {}: {}", emailId, e.getMessage());
+                        }
+                    }
+
+                    return result;
+                } finally {
+                    folder.close(false);
+                }
+            } catch (Exception e) {
+                logger.error("Failed to get email content: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to get email content: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    private ObjectNode messageToContent(Message msg) throws MessagingException, IOException {
+        ObjectNode node = messageToMetadata(msg);
+
+        // Extract body
+        String body = extractTextBody(msg);
+        node.put("body", body);
+
+        // Extract attachments info
+        ArrayNode attachments = node.putArray("attachments");
+        extractAttachments(msg, attachments);
+
+        // Message-ID for threading
+        String[] messageIdHeader = msg.getHeader("Message-ID");
+        if (messageIdHeader != null && messageIdHeader.length > 0) {
+            node.put("message_id", messageIdHeader[0]);
+        }
+
+        String[] inReplyTo = msg.getHeader("In-Reply-To");
+        if (inReplyTo != null && inReplyTo.length > 0) {
+            node.put("in_reply_to", inReplyTo[0]);
+        }
+
+        return node;
+    }
+
+    private String extractTextBody(Part part) throws MessagingException, IOException {
+        if (part.isMimeType("text/plain")) {
+            return (String) part.getContent();
+        }
+        if (part.isMimeType("text/html")) {
+            return (String) part.getContent();
+        }
+        if (part.isMimeType("multipart/*")) {
+            Multipart mp = (Multipart) part.getContent();
+            String text = null;
+            for (int i = 0; i < mp.getCount(); i++) {
+                BodyPart bp = mp.getBodyPart(i);
+                String disposition = bp.getDisposition();
+                if (disposition == null || !disposition.equalsIgnoreCase(Part.ATTACHMENT)) {
+                    String body = extractTextBody(bp);
+                    if (body != null) {
+                        if (text == null || bp.isMimeType("text/html")) {
+                            text = body;
+                        }
+                    }
+                }
+            }
+            return text;
+        }
+        return null;
+    }
+
+    private void extractAttachments(Part part, ArrayNode attachments) throws MessagingException, IOException {
+        if (part.isMimeType("multipart/*")) {
+            Multipart mp = (Multipart) part.getContent();
+            for (int i = 0; i < mp.getCount(); i++) {
+                BodyPart bp = mp.getBodyPart(i);
+                String disposition = bp.getDisposition();
+                if (disposition != null && disposition.equalsIgnoreCase(Part.ATTACHMENT)) {
+                    ObjectNode att = objectMapper.createObjectNode();
+                    att.put("filename", bp.getFileName());
+                    att.put("content_type", bp.getContentType());
+                    att.put("size_bytes", bp.getSize());
+                    attachments.add(att);
+                }
+                extractAttachments(bp, attachments);
+            }
+        }
+    }
+
+    @Override
+    public CompletableFuture<JsonNode> checkUnread(int maxIds) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Folder folder = openFolder("INBOX", Folder.READ_ONLY);
+                try {
+                    int totalCount = folder.getMessageCount();
+                    int unreadCount = folder.getUnreadMessageCount();
+
+                    // Get unread messages
+                    FlagTerm unseenTerm = new FlagTerm(new Flags(Flags.Flag.SEEN), false);
+                    Message[] unreadMessages = folder.search(unseenTerm);
+
+                    // Sort by date descending
+                    Arrays.sort(unreadMessages, (m1, m2) -> {
+                        try {
+                            Date d1 = m1.getReceivedDate();
+                            Date d2 = m2.getReceivedDate();
+                            if (d1 == null) d1 = new Date(0);
+                            if (d2 == null) d2 = new Date(0);
+                            return d2.compareTo(d1);
+                        } catch (MessagingException e) {
+                            return 0;
+                        }
+                    });
+
+                    ObjectNode result = objectMapper.createObjectNode();
+                    result.put("total_unread", unreadCount);
+                    result.put("total_count", totalCount);
+
+                    ObjectNode byCategory = result.putObject("by_category");
+                    ObjectNode primary = byCategory.putObject("primary");
+                    primary.put("unread_count", unreadCount);
+
+                    ArrayNode emailIds = primary.putArray("email_ids");
+                    ArrayNode emails = primary.putArray("emails");
+                    int count = Math.min(maxIds, unreadMessages.length);
+                    for (int i = 0; i < count; i++) {
+                        Message msg = unreadMessages[i];
+                        emailIds.add(String.valueOf(msg.getMessageNumber()));
+                        ObjectNode emailInfo = objectMapper.createObjectNode();
+                        emailInfo.put("email_id", String.valueOf(msg.getMessageNumber()));
+                        emailInfo.put("size_bytes", msg.getSize());
+                        emails.add(emailInfo);
+                    }
+                    primary.put("has_more", unreadMessages.length > maxIds);
+
+                    return result;
+                } finally {
+                    folder.close(false);
+                }
+            } catch (Exception e) {
+                logger.error("Failed to check unread: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to check unread: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<JsonNode> listFolders() {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Store store = getImapStore();
+                Folder defaultFolder = store.getDefaultFolder();
+                Folder[] folders = defaultFolder.list("*");
+
+                ObjectNode result = objectMapper.createObjectNode();
+                ArrayNode foldersArray = result.putArray("folders");
+
+                for (Folder folder : folders) {
+                    ObjectNode folderNode = objectMapper.createObjectNode();
+                    folderNode.put("name", folder.getFullName());
+
+                    // Get attributes
+                    ArrayNode attrs = folderNode.putArray("attributes");
+                    if ((folder.getType() & Folder.HOLDS_MESSAGES) != 0) {
+                        attrs.add("\\HasNoChildren");
+                    }
+                    if ((folder.getType() & Folder.HOLDS_FOLDERS) != 0) {
+                        attrs.add("\\HasChildren");
+                    }
+
+                    foldersArray.add(folderNode);
+                }
+
+                return result;
+            } catch (Exception e) {
+                logger.error("Failed to list folders: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to list folders: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<JsonNode> downloadAttachment(String emailId, String attachmentName, String savePath) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Folder folder = openFolder("INBOX", Folder.READ_ONLY);
+                try {
+                    int msgNum = Integer.parseInt(emailId);
+                    Message msg = folder.getMessage(msgNum);
+
+                    // Find and save the attachment
+                    boolean found = saveAttachment(msg, attachmentName, savePath);
+
+                    ObjectNode result = objectMapper.createObjectNode();
+                    result.put("success", found);
+                    result.put("email_id", emailId);
+                    result.put("attachment_name", attachmentName);
+                    result.put("save_path", savePath);
+
+                    if (!found) {
+                        result.put("error", "Attachment not found: " + attachmentName);
+                    }
+
+                    return result;
+                } finally {
+                    folder.close(false);
+                }
+            } catch (Exception e) {
+                logger.error("Failed to download attachment: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to download attachment: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    private boolean saveAttachment(Part part, String filename, String savePath)
+            throws MessagingException, IOException {
+        if (part.isMimeType("multipart/*")) {
+            Multipart mp = (Multipart) part.getContent();
+            for (int i = 0; i < mp.getCount(); i++) {
+                BodyPart bp = mp.getBodyPart(i);
+                String disposition = bp.getDisposition();
+                if (disposition != null && disposition.equalsIgnoreCase(Part.ATTACHMENT)) {
+                    if (filename.equals(bp.getFileName())) {
+                        try (InputStream is = bp.getInputStream()) {
+                            Files.copy(is, Path.of(savePath));
+                        }
+                        return true;
+                    }
+                }
+                if (saveAttachment(bp, filename, savePath)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // ==================== Email Writing ====================
+
+    @Override
+    public CompletableFuture<JsonNode> sendEmail(List<String> recipients, String subject, String body,
+                                                  List<String> cc, List<String> bcc, List<String> attachments,
+                                                  String inReplyTo, String references) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Session session = getSmtpSession();
+                MimeMessage message = new MimeMessage(session);
+
+                // From
+                String fromAddress = config.getEmailAddress();
+                String fromName = config.getFullName();
+                if (fromName != null && !fromName.isEmpty()) {
+                    message.setFrom(new InternetAddress(fromAddress, fromName));
+                } else {
+                    message.setFrom(new InternetAddress(fromAddress));
+                }
+
+                // To
+                for (String recipient : recipients) {
+                    message.addRecipient(Message.RecipientType.TO, new InternetAddress(recipient));
+                }
+
+                // CC
+                if (cc != null) {
+                    for (String addr : cc) {
+                        message.addRecipient(Message.RecipientType.CC, new InternetAddress(addr));
+                    }
+                }
+
+                // BCC
+                if (bcc != null) {
+                    for (String addr : bcc) {
+                        message.addRecipient(Message.RecipientType.BCC, new InternetAddress(addr));
+                    }
+                }
+
+                // Subject
+                message.setSubject(subject);
+
+                // Threading headers
+                if (inReplyTo != null) {
+                    message.setHeader("In-Reply-To", inReplyTo);
+                }
+                if (references != null) {
+                    message.setHeader("References", references);
+                }
+
+                // Body - detect format and convert if needed
+                String htmlBody = convertToHtml(body);
+
+                // Build message content
+                if (attachments != null && !attachments.isEmpty()) {
+                    Multipart multipart = new MimeMultipart();
+
+                    // Body part
+                    MimeBodyPart textPart = new MimeBodyPart();
+                    textPart.setContent(htmlBody, "text/html; charset=utf-8");
+                    multipart.addBodyPart(textPart);
+
+                    // Attachment parts
+                    for (String filePath : attachments) {
+                        MimeBodyPart attachPart = new MimeBodyPart();
+                        attachPart.attachFile(new File(filePath));
+                        multipart.addBodyPart(attachPart);
+                    }
+
+                    message.setContent(multipart);
+                } else {
+                    message.setContent(htmlBody, "text/html; charset=utf-8");
+                }
+
+                message.setSentDate(new Date());
+
+                // Send
+                String password = config.isOAuth2()
+                    ? getXOAuth2Token()
+                    : config.getSmtpPassword();
+
+                try (Transport transport = session.getTransport("smtp")) {
+                    transport.connect(config.getSmtpHost(), config.getSmtpPort(),
+                        config.getSmtpUsername(), password);
+                    transport.sendMessage(message, message.getAllRecipients());
+                }
+
+                ObjectNode result = objectMapper.createObjectNode();
+                result.put("success", true);
+                result.put("from", fromAddress);
+                result.put("to", String.join(", ", recipients));
+                result.put("subject", subject);
+
+                return result;
+            } catch (Exception e) {
+                logger.error("Failed to send email: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to send email: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    private String convertToHtml(String body) {
+        // Check if already HTML
+        if (body.trim().startsWith("<") && body.contains("</")) {
+            return body;
+        }
+
+        // Try to detect Markdown
+        if (body.contains("**") || body.contains("##") || body.contains("```")
+            || body.contains("- ") || body.contains("* ")) {
+            // Looks like Markdown, convert to HTML
+            Node document = markdownParser.parse(body);
+            return htmlRenderer.render(document);
+        }
+
+        // Plain text - convert newlines to <br>
+        return body.replace("\n", "<br>\n");
+    }
+
+    @Override
+    public CompletableFuture<JsonNode> markAsRead(String mailbox, List<String> emailIds) {
+        return setSeenFlag(mailbox, emailIds, true);
+    }
+
+    @Override
+    public CompletableFuture<JsonNode> markAsUnread(String mailbox, List<String> emailIds) {
+        return setSeenFlag(mailbox, emailIds, false);
+    }
+
+    private CompletableFuture<JsonNode> setSeenFlag(String mailbox, List<String> emailIds, boolean seen) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Folder folder = openFolder(mailbox, Folder.READ_WRITE);
+                try {
+                    List<String> successIds = new ArrayList<>();
+                    List<String> failedIds = new ArrayList<>();
+
+                    for (String emailId : emailIds) {
+                        try {
+                            int msgNum = Integer.parseInt(emailId);
+                            Message msg = folder.getMessage(msgNum);
+                            msg.setFlag(Flags.Flag.SEEN, seen);
+                            successIds.add(emailId);
+                        } catch (Exception e) {
+                            failedIds.add(emailId);
+                            logger.warn("Failed to mark email {} as {}: {}",
+                                emailId, seen ? "read" : "unread", e.getMessage());
+                        }
+                    }
+
+                    ObjectNode result = objectMapper.createObjectNode();
+                    ArrayNode marked = result.putArray("marked_ids");
+                    successIds.forEach(marked::add);
+                    ArrayNode failed = result.putArray("failed_ids");
+                    failedIds.forEach(failed::add);
+
+                    return result;
+                } finally {
+                    folder.close(true);
+                }
+            } catch (Exception e) {
+                logger.error("Failed to set seen flag: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to set seen flag: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<JsonNode> deleteEmails(String mailbox, List<String> emailIds) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Folder folder = openFolder(mailbox, Folder.READ_WRITE);
+                try {
+                    List<String> deletedIds = new ArrayList<>();
+                    List<String> failedIds = new ArrayList<>();
+
+                    for (String emailId : emailIds) {
+                        try {
+                            int msgNum = Integer.parseInt(emailId);
+                            Message msg = folder.getMessage(msgNum);
+                            msg.setFlag(Flags.Flag.DELETED, true);
+                            deletedIds.add(emailId);
+                        } catch (Exception e) {
+                            failedIds.add(emailId);
+                            logger.warn("Failed to delete email {}: {}", emailId, e.getMessage());
+                        }
+                    }
+
+                    ObjectNode result = objectMapper.createObjectNode();
+                    ArrayNode deleted = result.putArray("deleted_ids");
+                    deletedIds.forEach(deleted::add);
+                    ArrayNode failed = result.putArray("failed_ids");
+                    failedIds.forEach(failed::add);
+
+                    return result;
+                } finally {
+                    folder.close(true); // Expunge on close
+                }
+            } catch (Exception e) {
+                logger.error("Failed to delete emails: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to delete emails: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    // ==================== Flags ====================
+
+    @Override
+    public CompletableFuture<JsonNode> listFlagged(String mailbox, String keyword) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Folder folder = openFolder(mailbox, Folder.READ_ONLY);
+                try {
+                    FlagTerm flaggedTerm = new FlagTerm(new Flags(Flags.Flag.FLAGGED), true);
+                    Message[] flaggedMessages = folder.search(flaggedTerm);
+
+                    ObjectNode result = objectMapper.createObjectNode();
+                    ObjectNode byKeyword = result.putObject("by_keyword");
+
+                    // Group by keyword flags
+                    Map<String, List<String>> keywordGroups = new HashMap<>();
+                    keywordGroups.put("\\Flagged", new ArrayList<>());
+
+                    for (Message msg : flaggedMessages) {
+                        String msgId = String.valueOf(msg.getMessageNumber());
+                        keywordGroups.get("\\Flagged").add(msgId);
+
+                        // Check for user-defined flags (keywords)
+                        String[] userFlags = msg.getFlags().getUserFlags();
+                        for (String flag : userFlags) {
+                            keywordGroups.computeIfAbsent(flag, k -> new ArrayList<>()).add(msgId);
+                        }
+                    }
+
+                    // Filter by keyword if specified
+                    if (keyword != null) {
+                        List<String> ids = keywordGroups.getOrDefault(keyword, List.of());
+                        ObjectNode keywordNode = byKeyword.putObject(keyword);
+                        keywordNode.put("count", ids.size());
+                        ArrayNode idsArray = keywordNode.putArray("email_ids");
+                        ids.forEach(idsArray::add);
+                    } else {
+                        for (Map.Entry<String, List<String>> entry : keywordGroups.entrySet()) {
+                            ObjectNode keywordNode = byKeyword.putObject(entry.getKey());
+                            keywordNode.put("count", entry.getValue().size());
+                            ArrayNode idsArray = keywordNode.putArray("email_ids");
+                            entry.getValue().forEach(idsArray::add);
+                        }
+                    }
+
+                    result.put("total_flagged", flaggedMessages.length);
+
+                    return result;
+                } finally {
+                    folder.close(false);
+                }
+            } catch (Exception e) {
+                logger.error("Failed to list flagged: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to list flagged: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<JsonNode> setFlags(String mailbox, List<String> emailIds, List<String> flags) {
+        return modifyFlags(mailbox, emailIds, flags, true);
+    }
+
+    @Override
+    public CompletableFuture<JsonNode> removeFlags(String mailbox, List<String> emailIds, List<String> flags) {
+        return modifyFlags(mailbox, emailIds, flags, false);
+    }
+
+    private CompletableFuture<JsonNode> modifyFlags(String mailbox, List<String> emailIds,
+                                                     List<String> flagNames, boolean add) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Folder folder = openFolder(mailbox, Folder.READ_WRITE);
+                try {
+                    // Build flags object
+                    Flags flags = new Flags();
+                    for (String flag : flagNames) {
+                        if ("\\Flagged".equalsIgnoreCase(flag)) {
+                            flags.add(Flags.Flag.FLAGGED);
+                        } else if ("\\Seen".equalsIgnoreCase(flag)) {
+                            flags.add(Flags.Flag.SEEN);
+                        } else if ("\\Deleted".equalsIgnoreCase(flag)) {
+                            flags.add(Flags.Flag.DELETED);
+                        } else {
+                            // User-defined flag (keyword)
+                            flags.add(flag);
+                        }
+                    }
+
+                    List<String> successIds = new ArrayList<>();
+                    List<String> failedIds = new ArrayList<>();
+
+                    for (String emailId : emailIds) {
+                        try {
+                            int msgNum = Integer.parseInt(emailId);
+                            Message msg = folder.getMessage(msgNum);
+                            msg.setFlags(flags, add);
+                            successIds.add(emailId);
+                        } catch (Exception e) {
+                            failedIds.add(emailId);
+                            logger.warn("Failed to {} flags on email {}: {}",
+                                add ? "set" : "remove", emailId, e.getMessage());
+                        }
+                    }
+
+                    ObjectNode result = objectMapper.createObjectNode();
+                    ArrayNode success = result.putArray("success_ids");
+                    successIds.forEach(success::add);
+                    ArrayNode failed = result.putArray("failed_ids");
+                    failedIds.forEach(failed::add);
+
+                    return result;
+                } finally {
+                    folder.close(true);
+                }
+            } catch (Exception e) {
+                logger.error("Failed to modify flags: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to modify flags: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    // ==================== Status ====================
+
+    @Override
+    public CompletableFuture<JsonNode> getStatus() {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Folder folder = openFolder("INBOX", Folder.READ_ONLY);
+                try {
+                    int unreadCount = folder.getUnreadMessageCount();
+
+                    FlagTerm flaggedTerm = new FlagTerm(new Flags(Flags.Flag.FLAGGED), true);
+                    Message[] flaggedMessages = folder.search(flaggedTerm);
+                    int flaggedCount = flaggedMessages.length;
+
+                    ObjectNode result = objectMapper.createObjectNode();
+                    result.put("account_name", config.getAccountName());
+                    result.put("email_address", config.getEmailAddress());
+                    result.put("unread_count", unreadCount);
+                    result.put("flagged_count", flaggedCount);
+
+                    return result;
+                } finally {
+                    folder.close(false);
+                }
+            } catch (Exception e) {
+                logger.error("Failed to get status: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to get status: " + e.getMessage(), e);
+            }
+        });
+    }
+}
