@@ -179,7 +179,14 @@ public class EmailClient implements IEmailClient {
                         messages = folder.getMessages();
                     }
 
-                    // Sort by date
+                    // Batch-fetch headers in one IMAP round-trip (critical for performance)
+                    // Without this, each getReceivedDate() call in sort triggers individual FETCH
+                    FetchProfile fetchProfile = new FetchProfile();
+                    fetchProfile.add(FetchProfile.Item.ENVELOPE);  // Subject, From, To, Date, etc.
+                    fetchProfile.add(FetchProfile.Item.FLAGS);     // Read/Flagged status
+                    folder.fetch(messages, fetchProfile);
+
+                    // Sort by date (now uses cached headers, no network calls)
                     boolean descending = "desc".equalsIgnoreCase(order);
                     Arrays.sort(messages, (m1, m2) -> {
                         try {
