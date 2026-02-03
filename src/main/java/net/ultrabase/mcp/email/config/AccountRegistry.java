@@ -254,4 +254,46 @@ public class AccountRegistry {
 
         return true;
     }
+
+    /**
+     * Renames an account (changes its alias).
+     * Updates the map key, the config's accountName field, default account reference if applicable,
+     * and invalidates the cached client.
+     *
+     * @param oldAccountName Current account name
+     * @param newAccountName New account name
+     * @return true if renamed, false if old account not found or new name already exists
+     */
+    public boolean renameAccount(String oldAccountName, String newAccountName) {
+        // Validate old account exists
+        AccountConfig config = accounts.get(oldAccountName);
+        if (config == null) {
+            logger.warn("Cannot rename: account '{}' not found", oldAccountName);
+            return false;
+        }
+
+        // Validate new name doesn't already exist
+        if (accounts.containsKey(newAccountName)) {
+            logger.warn("Cannot rename: account '{}' already exists", newAccountName);
+            return false;
+        }
+
+        // Update the config's internal account name
+        config.setAccountName(newAccountName);
+
+        // Re-key in the map
+        accounts.remove(oldAccountName);
+        accounts.put(newAccountName, config);
+
+        // Update default if this was the default account
+        if (oldAccountName.equals(defaultAccountName)) {
+            defaultAccountName = newAccountName;
+        }
+
+        // Invalidate cached client (will be recreated with new name on next use)
+        clientCache.remove(oldAccountName);
+
+        logger.info("Renamed account '{}' to '{}'", oldAccountName, newAccountName);
+        return true;
+    }
 }
