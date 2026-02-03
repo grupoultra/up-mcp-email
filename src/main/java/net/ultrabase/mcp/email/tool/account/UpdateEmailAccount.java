@@ -36,8 +36,8 @@ public class UpdateEmailAccount extends BaseTool {
 
     @Override
     public String getDescription() {
-        return "Update an existing email account's password, display name, and/or account alias. " +
-            "At least one of password, full_name, or new_account_name must be provided.";
+        return "Update an existing email account's password, display name, signature, footer setting, " +
+            "and/or account alias. At least one field must be provided.";
     }
 
     @Override
@@ -45,7 +45,9 @@ public class UpdateEmailAccount extends BaseTool {
         return schema(
             "password", "string", "New password (App Password for Gmail). Updates both IMAP and SMTP. (optional)",
             "full_name", "string", "New display name for the account. (optional)",
-            "new_account_name", "string", "New account alias/name. Use to rename the account identifier. (optional)"
+            "new_account_name", "string", "New account alias/name. Use to rename the account identifier. (optional)",
+            "signature", "string", "Personal signature for emails (optional, set empty string to remove)",
+            "include_footer", "boolean", "Include 'Sent vía ultraPRO' footer (optional)"
         );
     }
 
@@ -57,13 +59,24 @@ public class UpdateEmailAccount extends BaseTool {
             String fullName = getString(args, "full_name", null);
             String newAccountName = getString(args, "new_account_name", null);
 
+            // For signature, we need to distinguish between not provided vs empty string
+            boolean hasSignature = args.containsKey("signature");
+            String signature = hasSignature ? getString(args, "signature", "") : null;
+
+            // For include_footer, null means not provided
+            Boolean includeFooter = args.containsKey("include_footer")
+                ? getBoolean(args, "include_footer", true)
+                : null;
+            boolean hasIncludeFooter = includeFooter != null;
+
             boolean hasPassword = password != null && !password.isEmpty();
             boolean hasFullName = fullName != null && !fullName.isEmpty();
             boolean hasNewName = newAccountName != null && !newAccountName.isEmpty();
 
-            if (!hasPassword && !hasFullName && !hasNewName) {
+            if (!hasPassword && !hasFullName && !hasNewName && !hasSignature && !hasIncludeFooter) {
                 throw new IllegalArgumentException(
-                    "At least one of 'password', 'full_name', or 'new_account_name' must be provided");
+                    "At least one of 'password', 'full_name', 'new_account_name', 'signature', " +
+                    "or 'include_footer' must be provided");
             }
 
             List<String> updatedFields = new ArrayList<>();
@@ -91,6 +104,30 @@ public class UpdateEmailAccount extends BaseTool {
                 }
                 if (hasFullName) {
                     updatedFields.add("full_name='" + fullName + "'");
+                }
+            }
+
+            // Handle signature and footer updates
+            if (hasSignature || hasIncludeFooter) {
+                if (!context.accountRegistry().updateAccountSignature(
+                        finalAccountName, hasSignature ? signature : null, includeFooter)) {
+                    throw new IllegalArgumentException("Account '" + finalAccountName + "' not found");
+                }
+
+                if (hasSignature) {
+                    if (signature.isEmpty()) {
+                        updatedFields.add("signature removed");
+                    } else {
+                        String truncated = signature.length() > 30
+                            ? signature.substring(0, 30) + "..."
+                            : signature;
+                        // Replace newlines for display
+                        truncated = truncated.replace("\n", "\\n");
+                        updatedFields.add("signature='" + truncated + "'");
+                    }
+                }
+                if (hasIncludeFooter) {
+                    updatedFields.add("include_footer=" + includeFooter);
                 }
             }
 

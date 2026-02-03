@@ -608,7 +608,7 @@ public class EmailClient implements IEmailClient {
     @Override
     public CompletableFuture<JsonNode> sendEmail(List<String> recipients, String subject, String body,
                                                   List<String> cc, List<String> bcc, List<String> attachments,
-                                                  String inReplyTo, String references) {
+                                                  String inReplyTo, String references, boolean includeSignature) {
         return CompletableFuture.supplyAsync(() -> {
             try {
                 Session session = getSmtpSession();
@@ -653,8 +653,11 @@ public class EmailClient implements IEmailClient {
                     message.setHeader("References", references);
                 }
 
+                // Compose body with signature and footer
+                String composedBody = composeEmailBody(body, includeSignature);
+
                 // Body - detect format and convert if needed
-                String htmlBody = convertToHtml(body);
+                String htmlBody = convertToHtml(composedBody);
 
                 // Build message content
                 if (attachments != null && !attachments.isEmpty()) {
@@ -702,6 +705,30 @@ public class EmailClient implements IEmailClient {
                 throw new RuntimeException("Failed to send email: " + e.getMessage(), e);
             }
         });
+    }
+
+    /**
+     * Composes the final email body by appending signature and footer as needed.
+     *
+     * @param body             Original email body
+     * @param includeSignature Whether to include account signature
+     * @return Composed body with signature and footer
+     */
+    private String composeEmailBody(String body, boolean includeSignature) {
+        StringBuilder finalBody = new StringBuilder(body);
+
+        // Add signature if exists and enabled
+        String signature = config.getSignature();
+        if (includeSignature && signature != null && !signature.isBlank()) {
+            finalBody.append("\n\n").append(signature);
+        }
+
+        // Add footer if enabled
+        if (config.isIncludeFooter()) {
+            finalBody.append("\n\n--\nSent vía ultraPRO");
+        }
+
+        return finalBody.toString();
     }
 
     private String convertToHtml(String body) {

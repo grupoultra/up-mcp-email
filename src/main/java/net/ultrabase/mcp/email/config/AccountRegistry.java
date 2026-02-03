@@ -257,6 +257,31 @@ public class AccountRegistry {
     }
 
     /**
+     * Updates an account's signature and footer settings.
+     *
+     * @param accountName   Account name
+     * @param signature     New signature (null to skip, empty string to remove)
+     * @param includeFooter Whether to include ultraPRO footer (null to skip)
+     * @return true if updated, false if account not found
+     */
+    public boolean updateAccountSignature(String accountName, String signature, Boolean includeFooter) {
+        AccountConfig config = accounts.get(accountName);
+        if (config == null) {
+            return false;
+        }
+
+        if (signature != null) {
+            config.setSignature(signature.isEmpty() ? null : signature);
+        }
+
+        if (includeFooter != null) {
+            config.setIncludeFooter(includeFooter);
+        }
+
+        return true;
+    }
+
+    /**
      * Renames an account (changes its alias).
      * Updates the map key, the config's accountName field, default account reference if applicable,
      * and invalidates the cached client.

@@ -74,6 +74,10 @@ public class AccountConfig {
     // Default flag
     private boolean isDefault = false;
 
+    // Signature and footer settings
+    private String signature;           // Personal signature for emails (nullable)
+    private boolean includeFooter = true;  // Include "Sent vía ultraPRO" footer (default: true)
+
     public AccountConfig() {}
 
     public AccountConfig(String accountName, String emailAddress) {
@@ -273,6 +277,22 @@ public class AccountConfig {
         this.isDefault = isDefault;
     }
 
+    public String getSignature() {
+        return signature;
+    }
+
+    public void setSignature(String signature) {
+        this.signature = signature;
+    }
+
+    public boolean isIncludeFooter() {
+        return includeFooter;
+    }
+
+    public void setIncludeFooter(boolean includeFooter) {
+        this.includeFooter = includeFooter;
+    }
+
     /**
      * Returns true if this account uses OAuth2 authentication.
      */
@@ -308,6 +328,8 @@ public class AccountConfig {
         masked.includeInStatus = this.includeInStatus;
         masked.statusCacheTtl = this.statusCacheTtl;
         masked.isDefault = this.isDefault;
+        masked.signature = this.signature;
+        masked.includeFooter = this.includeFooter;
         return masked;
     }
 

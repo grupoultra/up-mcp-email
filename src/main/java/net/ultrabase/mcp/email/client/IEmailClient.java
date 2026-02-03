@@ -95,19 +95,20 @@ public interface IEmailClient {
     /**
      * Sends an email.
      *
-     * @param recipients  List of recipient addresses
-     * @param subject     Email subject
-     * @param body        Email body (Markdown, HTML, or plain text)
-     * @param cc          CC addresses (optional)
-     * @param bcc         BCC addresses (optional)
-     * @param attachments List of file paths to attach (optional)
-     * @param inReplyTo   Message-ID being replied to (optional)
-     * @param references  Thread Message-IDs (optional)
+     * @param recipients       List of recipient addresses
+     * @param subject          Email subject
+     * @param body             Email body (Markdown, HTML, or plain text)
+     * @param cc               CC addresses (optional)
+     * @param bcc              BCC addresses (optional)
+     * @param attachments      List of file paths to attach (optional)
+     * @param inReplyTo        Message-ID being replied to (optional)
+     * @param references       Thread Message-IDs (optional)
+     * @param includeSignature Whether to include account signature (default: true)
      * @return Send result
      */
     CompletableFuture<JsonNode> sendEmail(List<String> recipients, String subject, String body,
                                            List<String> cc, List<String> bcc, List<String> attachments,
-                                           String inReplyTo, String references);
+                                           String inReplyTo, String references, boolean includeSignature);
 
     /**
      * Marks emails as read.

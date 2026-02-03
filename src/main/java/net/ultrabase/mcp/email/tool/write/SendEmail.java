@@ -47,7 +47,8 @@ public class SendEmail extends BaseTool {
             "bcc", "array:string", "A list of BCC email addresses (optional)",
             "attachments", "array:string", "A list of absolute file paths to attach to the email (optional)",
             "in_reply_to", "string", "Message-ID of the email being replied to. Enables proper threading. (optional)",
-            "references", "string", "Space-separated Message-IDs for the thread chain. Usually includes in_reply_to plus ancestors. (optional)"
+            "references", "string", "Space-separated Message-IDs for the thread chain. Usually includes in_reply_to plus ancestors. (optional)",
+            "include_signature", "boolean", "Include account signature in email (default: true)"
         );
     }
 
@@ -73,13 +74,14 @@ public class SendEmail extends BaseTool {
         List<String> attachments = getStringList(args, "attachments");
         String inReplyTo = getString(args, "in_reply_to", null);
         String references = getString(args, "references", null);
+        boolean includeSignature = getBoolean(args, "include_signature", true);
 
         return context.emailClient(accountName).sendEmail(
             recipients, subject, body,
             cc.isEmpty() ? null : cc,
             bcc.isEmpty() ? null : bcc,
             attachments.isEmpty() ? null : attachments,
-            inReplyTo, references
+            inReplyTo, references, includeSignature
         );
     }
 }
