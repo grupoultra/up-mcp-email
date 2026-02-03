@@ -42,16 +42,25 @@ public class EmailClient implements IEmailClient {
     private static final ObjectMapper objectMapper = new ObjectMapper()
         .registerModule(new JavaTimeModule());
 
+    // Refresh token 5 minutes before expiry to avoid edge cases
+    private static final long TOKEN_REFRESH_MARGIN_SECONDS = 300;
+
     private final AccountConfig config;
     private final Parser markdownParser;
     private final HtmlRenderer htmlRenderer;
+    private final Runnable onTokenRefreshed;
 
     private Session imapSession;
     private Session smtpSession;
     private Store imapStore;
 
     public EmailClient(AccountConfig config) {
+        this(config, null);
+    }
+
+    public EmailClient(AccountConfig config, Runnable onTokenRefreshed) {
         this.config = config;
+        this.onTokenRefreshed = onTokenRefreshed;
         this.markdownParser = Parser.builder().build();
         this.htmlRenderer = HtmlRenderer.builder().build();
     }
@@ -92,12 +101,13 @@ public class EmailClient implements IEmailClient {
             props.put("mail.imaps.sasl.mechanisms", "XOAUTH2");
         }
 
-        imapSession = Session.getInstance(props);
-        imapStore = imapSession.getStore("imaps");
-
+        // Get password/token BEFORE creating store (token refresh may invalidate cached state)
         String password = config.isOAuth2()
             ? getXOAuth2Token()
             : config.getImapPassword();
+
+        imapSession = Session.getInstance(props);
+        imapStore = imapSession.getStore("imaps");
 
         logger.debug("Connecting to IMAP: {}:{}", config.getImapHost(), config.getImapPort());
         imapStore.connect(config.getImapHost(), config.getImapPort(),
@@ -138,13 +148,56 @@ public class EmailClient implements IEmailClient {
     }
 
     private String getXOAuth2Token() {
-        // TODO: Implement OAuth2 token refresh if expired
-        // For now, return the stored access token
         String token = config.getOauthAccessToken();
         if (token == null || token.isEmpty()) {
             throw new IllegalStateException("OAuth2 access token not available for account: " + config.getAccountName());
         }
+
+        // Check if token needs refresh
+        Instant expiry = config.getOauthTokenExpiry();
+        if (expiry != null && Instant.now().plusSeconds(TOKEN_REFRESH_MARGIN_SECONDS).isAfter(expiry)) {
+            logger.info("OAuth2 token expired or expiring soon for {}, refreshing...", config.getAccountName());
+            token = refreshOAuthToken();
+        }
+
         return token;
+    }
+
+    private String refreshOAuthToken() {
+        String refreshToken = config.getOauthRefreshToken();
+        if (refreshToken == null || refreshToken.isEmpty()) {
+            throw new IllegalStateException("OAuth2 refresh token not available for account: " + config.getAccountName());
+        }
+
+        // Load OAuth credentials
+        String[] credentials = OAuthManager.loadBundledCredentials();
+        if (credentials == null) {
+            throw new IllegalStateException("OAuth credentials not found. Cannot refresh token.");
+        }
+
+        try {
+            OAuthManager.OAuthTokens newTokens = OAuthManager.refreshAccessToken(
+                refreshToken, credentials[0], credentials[1]);
+
+            // Update config with new tokens
+            config.setOauthAccessToken(newTokens.accessToken());
+            config.setOauthTokenExpiry(newTokens.expiry());
+            if (newTokens.refreshToken() != null && !newTokens.refreshToken().isEmpty()) {
+                config.setOauthRefreshToken(newTokens.refreshToken());
+            }
+
+            logger.info("OAuth2 token refreshed successfully for {}", config.getAccountName());
+
+            // Notify caller to save (if callback provided)
+            if (onTokenRefreshed != null) {
+                onTokenRefreshed.run();
+            }
+
+            return newTokens.accessToken();
+        } catch (OAuthManager.OAuthException e) {
+            logger.error("Failed to refresh OAuth token for {}: {}", config.getAccountName(), e.getMessage());
+            throw new IllegalStateException("OAuth token refresh failed: " + e.getMessage(), e);
+        }
     }
 
     private Folder openFolder(String mailboxName, int mode) throws MessagingException {
@@ -407,7 +460,14 @@ public class EmailClient implements IEmailClient {
                     FlagTerm unseenTerm = new FlagTerm(new Flags(Flags.Flag.SEEN), false);
                     Message[] unreadMessages = folder.search(unseenTerm);
 
-                    // Sort by date descending
+                    // Batch-fetch headers for sorting performance
+                    if (unreadMessages.length > 0) {
+                        FetchProfile fp = new FetchProfile();
+                        fp.add(FetchProfile.Item.ENVELOPE);
+                        folder.fetch(unreadMessages, fp);
+                    }
+
+                    // Sort by date descending (now uses cached headers)
                     Arrays.sort(unreadMessages, (m1, m2) -> {
                         try {
                             Date d1 = m1.getReceivedDate();
@@ -759,6 +819,13 @@ public class EmailClient implements IEmailClient {
                     FlagTerm flaggedTerm = new FlagTerm(new Flags(Flags.Flag.FLAGGED), true);
                     Message[] flaggedMessages = folder.search(flaggedTerm);
 
+                    // Batch-fetch flags for performance
+                    if (flaggedMessages.length > 0) {
+                        FetchProfile fp = new FetchProfile();
+                        fp.add(FetchProfile.Item.FLAGS);
+                        folder.fetch(flaggedMessages, fp);
+                    }
+
                     ObjectNode result = objectMapper.createObjectNode();
                     ObjectNode byKeyword = result.putObject("by_keyword");
 
@@ -840,16 +907,27 @@ public class EmailClient implements IEmailClient {
                     List<String> successIds = new ArrayList<>();
                     List<String> failedIds = new ArrayList<>();
 
+                    // Convert to message numbers and validate
+                    List<Integer> validMsgNums = new ArrayList<>();
                     for (String emailId : emailIds) {
                         try {
-                            int msgNum = Integer.parseInt(emailId);
-                            Message msg = folder.getMessage(msgNum);
-                            msg.setFlags(flags, add);
-                            successIds.add(emailId);
-                        } catch (Exception e) {
+                            validMsgNums.add(Integer.parseInt(emailId));
+                        } catch (NumberFormatException e) {
                             failedIds.add(emailId);
-                            logger.warn("Failed to {} flags on email {}: {}",
-                                add ? "set" : "remove", emailId, e.getMessage());
+                        }
+                    }
+
+                    // Batch fetch and set flags (much faster than one by one)
+                    if (!validMsgNums.isEmpty()) {
+                        int[] msgNumArray = validMsgNums.stream().mapToInt(Integer::intValue).toArray();
+                        Message[] messages = folder.getMessages(msgNumArray);
+
+                        // Set flags on all messages at once
+                        folder.setFlags(messages, flags, add);
+
+                        // Mark all as success
+                        for (int msgNum : msgNumArray) {
+                            successIds.add(String.valueOf(msgNum));
                         }
                     }
 

@@ -129,7 +129,8 @@ public class AccountRegistry {
 
         return clientCache.computeIfAbsent(name, n -> {
             AccountConfig config = getAccount(n);
-            return new EmailClient(config);
+            // Pass save callback so refreshed tokens are persisted
+            return new EmailClient(config, this::save);
         });
     }
 
