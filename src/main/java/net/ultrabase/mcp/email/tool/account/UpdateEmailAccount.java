@@ -11,14 +11,20 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import net.ultrabase.mcp.email.tool.BaseTool;
 import net.ultrabase.mcp.email.tool.ToolContext;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Updates an existing email account's password and/or display name.
@@ -27,9 +33,15 @@ import java.util.concurrent.CompletableFuture;
  */
 public class UpdateEmailAccount extends BaseTool {
 
+    private static final Logger logger = LoggerFactory.getLogger(UpdateEmailAccount.class);
     private static final ObjectMapper objectMapper = new ObjectMapper();
     private static final Path ASSETS_DIR = Path.of(
         System.getProperty("user.home"), ".ultrapro", "assets", "email");
+
+    // Pattern to match img src with local file paths (not http/https/data)
+    private static final Pattern IMG_SRC_PATTERN = Pattern.compile(
+        "<img\\s+[^>]*src\\s*=\\s*[\"'](?!(?:https?://|data:))([^\"']+)[\"']",
+        Pattern.CASE_INSENSITIVE);
 
     public UpdateEmailAccount(ToolContext context) {
         super(context);
@@ -69,6 +81,11 @@ public class UpdateEmailAccount extends BaseTool {
             // For signature, we need to distinguish between not provided vs empty string
             boolean hasSignature = args.containsKey("signature");
             String signature = hasSignature ? getString(args, "signature", "") : null;
+
+            // If signature is HTML with local images, embed them as base64
+            if (hasSignature && !signature.isEmpty() && isHtml(signature)) {
+                signature = embedLocalImages(signature);
+            }
 
             // For include_footer, null means not provided
             Boolean includeFooter = args.containsKey("include_footer")
@@ -191,5 +208,73 @@ public class UpdateEmailAccount extends BaseTool {
 
             return result;
         });
+    }
+
+    /**
+     * Checks if content appears to be HTML.
+     */
+    private boolean isHtml(String content) {
+        if (content == null || content.isBlank()) {
+            return false;
+        }
+        String trimmed = content.trim();
+        return trimmed.startsWith("<") && trimmed.contains("</");
+    }
+
+    /**
+     * Embeds local images in HTML as base64 data URIs.
+     * Copies images to assets directory and converts to base64.
+     *
+     * @param html HTML content with potential local image references
+     * @return HTML with images converted to base64 data URIs
+     */
+    private String embedLocalImages(String html) {
+        Matcher matcher = IMG_SRC_PATTERN.matcher(html);
+        StringBuffer result = new StringBuffer();
+        int imagesProcessed = 0;
+
+        while (matcher.find()) {
+            String imagePath = matcher.group(1);
+            Path imgFile = Path.of(imagePath);
+
+            if (Files.exists(imgFile) && Files.isReadable(imgFile)) {
+                try {
+                    // Copy to assets directory for backup
+                    Files.createDirectories(ASSETS_DIR);
+                    Path assetPath = ASSETS_DIR.resolve(imgFile.getFileName());
+                    Files.copy(imgFile, assetPath, StandardCopyOption.REPLACE_EXISTING);
+
+                    // Detect MIME type
+                    String mimeType = Files.probeContentType(imgFile);
+                    if (mimeType == null) {
+                        mimeType = "image/png"; // Default
+                    }
+
+                    // Read and encode as base64
+                    byte[] imageBytes = Files.readAllBytes(imgFile);
+                    String base64 = Base64.getEncoder().encodeToString(imageBytes);
+                    String dataUri = "data:" + mimeType + ";base64," + base64;
+
+                    // Replace in HTML
+                    String replacement = matcher.group().replace(imagePath, dataUri);
+                    matcher.appendReplacement(result, Matcher.quoteReplacement(replacement));
+
+                    imagesProcessed++;
+                    logger.info("Embedded image as base64: {} ({} bytes)", imgFile.getFileName(), imageBytes.length);
+                } catch (IOException e) {
+                    logger.warn("Failed to embed image {}: {}", imagePath, e.getMessage());
+                    // Keep original path if embedding fails
+                }
+            } else {
+                logger.warn("Image not found or not readable: {}", imagePath);
+            }
+        }
+        matcher.appendTail(result);
+
+        if (imagesProcessed > 0) {
+            logger.info("Embedded {} local images as base64 in signature HTML", imagesProcessed);
+        }
+
+        return result.toString();
     }
 }

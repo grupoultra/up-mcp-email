@@ -86,9 +86,14 @@ public class EmailClient implements IEmailClient {
     // ==================== Connection Management ====================
 
     private synchronized Store getImapStore() throws MessagingException {
+        long startTime = System.currentTimeMillis();
+
         if (imapStore != null && imapStore.isConnected()) {
+            logger.debug("[{}] IMAP store already connected (reusing)", config.getAccountName());
             return imapStore;
         }
+
+        logger.info("[{}] IMAP connection required (store null or disconnected)", config.getAccountName());
 
         Properties props = new Properties();
         props.put("mail.store.protocol", "imaps");
@@ -105,16 +110,28 @@ public class EmailClient implements IEmailClient {
         }
 
         // Get password/token BEFORE creating store (token refresh may invalidate cached state)
+        long tokenStartTime = System.currentTimeMillis();
         String password = config.isOAuth2()
             ? getXOAuth2Token()
             : config.getImapPassword();
+        long tokenElapsed = System.currentTimeMillis() - tokenStartTime;
+        if (tokenElapsed > 100) {
+            logger.info("[{}] Token retrieval took {}ms", config.getAccountName(), tokenElapsed);
+        }
 
         imapSession = Session.getInstance(props);
         imapStore = imapSession.getStore("imaps");
 
-        logger.debug("Connecting to IMAP: {}:{}", config.getImapHost(), config.getImapPort());
+        logger.info("[{}] Connecting to IMAP {}:{}...", config.getAccountName(),
+            config.getImapHost(), config.getImapPort());
+        long connectStartTime = System.currentTimeMillis();
         imapStore.connect(config.getImapHost(), config.getImapPort(),
             config.getImapUsername(), password);
+        long connectElapsed = System.currentTimeMillis() - connectStartTime;
+
+        long totalElapsed = System.currentTimeMillis() - startTime;
+        logger.info("[{}] IMAP connected in {}ms (connect: {}ms)",
+            config.getAccountName(), totalElapsed, connectElapsed);
 
         return imapStore;
     }
@@ -167,6 +184,9 @@ public class EmailClient implements IEmailClient {
     }
 
     private String refreshOAuthToken() {
+        long startTime = System.currentTimeMillis();
+        logger.info("[{}] Starting OAuth token refresh...", config.getAccountName());
+
         String refreshToken = config.getOauthRefreshToken();
         if (refreshToken == null || refreshToken.isEmpty()) {
             throw new IllegalStateException("OAuth2 refresh token not available for account: " + config.getAccountName());
@@ -179,8 +199,11 @@ public class EmailClient implements IEmailClient {
         }
 
         try {
+            long apiStartTime = System.currentTimeMillis();
             OAuthManager.OAuthTokens newTokens = OAuthManager.refreshAccessToken(
                 refreshToken, credentials[0], credentials[1]);
+            long apiElapsed = System.currentTimeMillis() - apiStartTime;
+            logger.info("[{}] OAuth API call completed in {}ms", config.getAccountName(), apiElapsed);
 
             // Update config with new tokens
             config.setOauthAccessToken(newTokens.accessToken());
@@ -189,7 +212,8 @@ public class EmailClient implements IEmailClient {
                 config.setOauthRefreshToken(newTokens.refreshToken());
             }
 
-            logger.info("OAuth2 token refreshed successfully for {}", config.getAccountName());
+            long totalElapsed = System.currentTimeMillis() - startTime;
+            logger.info("[{}] OAuth2 token refreshed successfully in {}ms", config.getAccountName(), totalElapsed);
 
             // Notify caller to save (if callback provided)
             if (onTokenRefreshed != null) {
@@ -198,18 +222,37 @@ public class EmailClient implements IEmailClient {
 
             return newTokens.accessToken();
         } catch (OAuthManager.OAuthException e) {
-            logger.error("Failed to refresh OAuth token for {}: {}", config.getAccountName(), e.getMessage());
+            long elapsed = System.currentTimeMillis() - startTime;
+            logger.error("[{}] Failed to refresh OAuth token after {}ms: {}",
+                config.getAccountName(), elapsed, e.getMessage());
             throw new IllegalStateException("OAuth token refresh failed: " + e.getMessage(), e);
         }
     }
 
     private Folder openFolder(String mailboxName, int mode) throws MessagingException {
+        long startTime = System.currentTimeMillis();
+        logger.debug("[{}] Opening folder: {}", config.getAccountName(), mailboxName);
+
         Store store = getImapStore();
+        long storeElapsed = System.currentTimeMillis() - startTime;
+
         Folder folder = store.getFolder(mailboxName);
         if (!folder.exists()) {
             throw new IllegalArgumentException("Mailbox not found: " + mailboxName);
         }
+
+        long openStartTime = System.currentTimeMillis();
         folder.open(mode);
+        long openElapsed = System.currentTimeMillis() - openStartTime;
+
+        long totalElapsed = System.currentTimeMillis() - startTime;
+        if (totalElapsed > 500) {
+            logger.info("[{}] Folder {} opened in {}ms (store: {}ms, open: {}ms)",
+                config.getAccountName(), mailboxName, totalElapsed, storeElapsed, openElapsed);
+        } else {
+            logger.debug("[{}] Folder {} opened in {}ms", config.getAccountName(), mailboxName, totalElapsed);
+        }
+
         return folder;
     }
 
@@ -220,14 +263,20 @@ public class EmailClient implements IEmailClient {
                                                            String order, String subject, String fromAddr,
                                                            String toAddr, String since, String before) {
         return CompletableFuture.supplyAsync(() -> {
+            long methodStartTime = System.currentTimeMillis();
+            logger.info("[{}] listEmailsMetadata started (mailbox={}, page={}, pageSize={})",
+                config.getAccountName(), mailbox, page, pageSize);
             try {
                 Folder folder = openFolder(mailbox, Folder.READ_ONLY);
+                long folderOpenElapsed = System.currentTimeMillis() - methodStartTime;
                 try {
                     int totalCount = folder.getMessageCount();
+                    logger.debug("[{}] Folder has {} messages", config.getAccountName(), totalCount);
 
                     // Build search term if filters are provided
                     SearchTerm searchTerm = buildSearchTerm(subject, fromAddr, toAddr, since, before);
 
+                    long fetchStartTime = System.currentTimeMillis();
                     Message[] messages;
                     if (searchTerm != null) {
                         messages = folder.search(searchTerm);
@@ -241,6 +290,9 @@ public class EmailClient implements IEmailClient {
                     fetchProfile.add(FetchProfile.Item.ENVELOPE);  // Subject, From, To, Date, etc.
                     fetchProfile.add(FetchProfile.Item.FLAGS);     // Read/Flagged status
                     folder.fetch(messages, fetchProfile);
+                    long fetchElapsed = System.currentTimeMillis() - fetchStartTime;
+                    logger.debug("[{}] Fetched {} messages in {}ms",
+                        config.getAccountName(), messages.length, fetchElapsed);
 
                     // Sort by date (now uses cached headers, no network calls)
                     boolean descending = "desc".equalsIgnoreCase(order);
@@ -274,12 +326,18 @@ public class EmailClient implements IEmailClient {
                     result.put("filtered_count", messages.length);
                     result.put("has_more", end < messages.length);
 
+                    long totalElapsed = System.currentTimeMillis() - methodStartTime;
+                    logger.info("[{}] listEmailsMetadata completed in {}ms (folderOpen: {}ms, fetch: {}ms)",
+                        config.getAccountName(), totalElapsed, folderOpenElapsed, fetchElapsed);
+
                     return result;
                 } finally {
                     folder.close(false);
                 }
             } catch (Exception e) {
-                logger.error("Failed to list emails: {}", e.getMessage(), e);
+                long elapsed = System.currentTimeMillis() - methodStartTime;
+                logger.error("[{}] Failed to list emails after {}ms: {}",
+                    config.getAccountName(), elapsed, e.getMessage(), e);
                 throw new RuntimeException("Failed to list emails: " + e.getMessage(), e);
             }
         });
@@ -795,8 +853,9 @@ public class EmailClient implements IEmailClient {
 
     /**
      * Composes the signature HTML with embedded image reference if configured.
+     * Supports both plain text signatures (converted to HTML) and full HTML signatures.
      *
-     * @return HTML of signature with CID reference, or empty string if no signature
+     * @return HTML of signature, or empty string if no signature configured
      */
     private String composeSignatureHtml() {
         String signature = config.getSignature();
@@ -808,17 +867,28 @@ public class EmailClient implements IEmailClient {
 
         StringBuilder html = new StringBuilder();
 
-        // Text signature
+        // Check if signature is already HTML
         if (signature != null && !signature.isBlank()) {
-            // Convert signature text to HTML (respect line breaks)
-            String sigHtml = signature.replace("\n", "<br>\n");
-            html.append("<div class=\"signature\">\n");
-            html.append(sigHtml);
-            html.append("\n</div>\n");
-        }
+            if (isHtml(signature)) {
+                // HTML signature - use as-is (may contain its own embedded images as base64)
+                html.append(signature);
+            } else {
+                // Plain text signature - convert to HTML
+                String sigHtml = signature.replace("\n", "<br>\n");
+                html.append("<div class=\"signature\">\n");
+                html.append(sigHtml);
+                html.append("\n</div>\n");
 
-        // Signature image (CID reference)
-        if (imagePath != null && !imagePath.isBlank()) {
+                // Signature image (CID reference) - only for plain text signatures
+                // HTML signatures are expected to include their own images
+                if (imagePath != null && !imagePath.isBlank()) {
+                    html.append("<div class=\"signature-logo\">\n");
+                    html.append("<img src=\"cid:").append(SIGNATURE_IMAGE_CID).append("\" alt=\"\">\n");
+                    html.append("</div>\n");
+                }
+            }
+        } else if (imagePath != null && !imagePath.isBlank()) {
+            // Only image, no text signature
             html.append("<div class=\"signature-logo\">\n");
             html.append("<img src=\"cid:").append(SIGNATURE_IMAGE_CID).append("\" alt=\"\">\n");
             html.append("</div>\n");
@@ -828,9 +898,27 @@ public class EmailClient implements IEmailClient {
     }
 
     /**
-     * Checks if a signature image is configured and exists.
+     * Checks if a string appears to be HTML content.
+     */
+    private boolean isHtml(String content) {
+        if (content == null || content.isBlank()) {
+            return false;
+        }
+        String trimmed = content.trim();
+        return trimmed.startsWith("<") && trimmed.contains("</");
+    }
+
+    /**
+     * Checks if a signature image needs to be embedded via CID.
+     * Returns false if signature is HTML (HTML signatures contain their own images).
      */
     private boolean hasSignatureImage() {
+        // If signature is HTML, it contains its own images - no CID needed
+        String signature = config.getSignature();
+        if (signature != null && isHtml(signature)) {
+            return false;
+        }
+
         String path = config.getSignatureImagePath();
         if (path == null || path.isBlank()) {
             return false;
