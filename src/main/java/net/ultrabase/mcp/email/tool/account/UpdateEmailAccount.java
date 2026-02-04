@@ -11,8 +11,10 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import net.ultrabase.mcp.email.tool.BaseTool;
 import net.ultrabase.mcp.email.tool.ToolContext;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -26,6 +28,8 @@ import java.util.concurrent.CompletableFuture;
 public class UpdateEmailAccount extends BaseTool {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
+    private static final Path ASSETS_DIR = Path.of(
+        System.getProperty("user.home"), ".ultrapro", "assets", "email");
 
     public UpdateEmailAccount(ToolContext context) {
         super(context);
@@ -76,7 +80,7 @@ public class UpdateEmailAccount extends BaseTool {
             boolean hasSignatureImage = args.containsKey("signature_image");
             String signatureImagePath = hasSignatureImage ? getString(args, "signature_image", "") : null;
 
-            // Validate signature image exists if provided (and not empty)
+            // Validate and copy signature image to assets directory if provided (and not empty)
             if (hasSignatureImage && !signatureImagePath.isEmpty()) {
                 Path imgPath = Path.of(signatureImagePath);
                 if (!Files.exists(imgPath)) {
@@ -84,6 +88,19 @@ public class UpdateEmailAccount extends BaseTool {
                 }
                 if (!Files.isReadable(imgPath)) {
                     throw new IllegalArgumentException("Signature image not readable: " + signatureImagePath);
+                }
+
+                // Copy to assets directory (unless already there)
+                if (!imgPath.startsWith(ASSETS_DIR)) {
+                    try {
+                        Files.createDirectories(ASSETS_DIR);
+                        Path targetPath = ASSETS_DIR.resolve(imgPath.getFileName());
+                        Files.copy(imgPath, targetPath, StandardCopyOption.REPLACE_EXISTING);
+                        signatureImagePath = targetPath.toString();
+                    } catch (IOException e) {
+                        throw new IllegalArgumentException(
+                            "Failed to copy signature image to assets: " + e.getMessage());
+                    }
                 }
             }
 
