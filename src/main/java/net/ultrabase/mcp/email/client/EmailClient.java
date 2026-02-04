@@ -832,11 +832,11 @@ public class EmailClient implements IEmailClient {
         finalHtml.append(htmlBody);
         finalHtml.append("\n</div>\n");
 
-        // Add signature if enabled
+        // Add signature if enabled (with spacing before)
         if (includeSignature) {
             String signatureHtml = composeSignatureHtml();
             if (!signatureHtml.isEmpty()) {
-                finalHtml.append("\n").append(signatureHtml);
+                finalHtml.append("\n<br><br>\n").append(signatureHtml);
             }
         }
 
