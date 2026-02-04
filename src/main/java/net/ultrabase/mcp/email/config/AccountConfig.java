@@ -77,6 +77,7 @@ public class AccountConfig {
     // Signature and footer settings
     private String signature;           // Personal signature for emails (nullable)
     private boolean includeFooter = true;  // Include "Sent vía ultraPRO" footer (default: true)
+    private String signatureImagePath;  // Absolute path to signature logo image (nullable)
 
     public AccountConfig() {}
 
@@ -293,6 +294,14 @@ public class AccountConfig {
         this.includeFooter = includeFooter;
     }
 
+    public String getSignatureImagePath() {
+        return signatureImagePath;
+    }
+
+    public void setSignatureImagePath(String signatureImagePath) {
+        this.signatureImagePath = signatureImagePath;
+    }
+
     /**
      * Returns true if this account uses OAuth2 authentication.
      */
@@ -330,6 +339,7 @@ public class AccountConfig {
         masked.isDefault = this.isDefault;
         masked.signature = this.signature;
         masked.includeFooter = this.includeFooter;
+        masked.signatureImagePath = this.signatureImagePath;
         return masked;
     }
 

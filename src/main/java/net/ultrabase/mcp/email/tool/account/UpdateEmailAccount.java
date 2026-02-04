@@ -11,6 +11,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import net.ultrabase.mcp.email.tool.BaseTool;
 import net.ultrabase.mcp.email.tool.ToolContext;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -36,8 +38,8 @@ public class UpdateEmailAccount extends BaseTool {
 
     @Override
     public String getDescription() {
-        return "Update an existing email account's password, display name, signature, footer setting, " +
-            "and/or account alias. At least one field must be provided.";
+        return "Update an existing email account's password, display name, signature, signature image, " +
+            "footer setting, and/or account alias. At least one field must be provided.";
     }
 
     @Override
@@ -47,7 +49,8 @@ public class UpdateEmailAccount extends BaseTool {
             "full_name", "string", "New display name for the account. (optional)",
             "new_account_name", "string", "New account alias/name. Use to rename the account identifier. (optional)",
             "signature", "string", "Personal signature for emails (optional, set empty string to remove)",
-            "include_footer", "boolean", "Include 'Sent vía ultraPRO' footer (optional)"
+            "include_footer", "boolean", "Include 'Sent vía ultraPRO' footer (optional)",
+            "signature_image", "string", "Absolute path to signature logo image (optional, set empty to remove)"
         );
     }
 
@@ -69,14 +72,30 @@ public class UpdateEmailAccount extends BaseTool {
                 : null;
             boolean hasIncludeFooter = includeFooter != null;
 
+            // For signature_image, we need to distinguish between not provided vs empty string
+            boolean hasSignatureImage = args.containsKey("signature_image");
+            String signatureImagePath = hasSignatureImage ? getString(args, "signature_image", "") : null;
+
+            // Validate signature image exists if provided (and not empty)
+            if (hasSignatureImage && !signatureImagePath.isEmpty()) {
+                Path imgPath = Path.of(signatureImagePath);
+                if (!Files.exists(imgPath)) {
+                    throw new IllegalArgumentException("Signature image not found: " + signatureImagePath);
+                }
+                if (!Files.isReadable(imgPath)) {
+                    throw new IllegalArgumentException("Signature image not readable: " + signatureImagePath);
+                }
+            }
+
             boolean hasPassword = password != null && !password.isEmpty();
             boolean hasFullName = fullName != null && !fullName.isEmpty();
             boolean hasNewName = newAccountName != null && !newAccountName.isEmpty();
 
-            if (!hasPassword && !hasFullName && !hasNewName && !hasSignature && !hasIncludeFooter) {
+            if (!hasPassword && !hasFullName && !hasNewName && !hasSignature
+                    && !hasIncludeFooter && !hasSignatureImage) {
                 throw new IllegalArgumentException(
                     "At least one of 'password', 'full_name', 'new_account_name', 'signature', " +
-                    "or 'include_footer' must be provided");
+                    "'include_footer', or 'signature_image' must be provided");
             }
 
             List<String> updatedFields = new ArrayList<>();
@@ -107,10 +126,13 @@ public class UpdateEmailAccount extends BaseTool {
                 }
             }
 
-            // Handle signature and footer updates
-            if (hasSignature || hasIncludeFooter) {
+            // Handle signature, footer, and signature image updates
+            if (hasSignature || hasIncludeFooter || hasSignatureImage) {
                 if (!context.accountRegistry().updateAccountSignature(
-                        finalAccountName, hasSignature ? signature : null, includeFooter)) {
+                        finalAccountName,
+                        hasSignature ? signature : null,
+                        includeFooter,
+                        hasSignatureImage ? signatureImagePath : null)) {
                     throw new IllegalArgumentException("Account '" + finalAccountName + "' not found");
                 }
 
@@ -128,6 +150,13 @@ public class UpdateEmailAccount extends BaseTool {
                 }
                 if (hasIncludeFooter) {
                     updatedFields.add("include_footer=" + includeFooter);
+                }
+                if (hasSignatureImage) {
+                    if (signatureImagePath.isEmpty()) {
+                        updatedFields.add("signature_image removed");
+                    } else {
+                        updatedFields.add("signature_image='" + signatureImagePath + "'");
+                    }
                 }
             }
 

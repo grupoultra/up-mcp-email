@@ -45,6 +45,9 @@ public class EmailClient implements IEmailClient {
     // Refresh token 5 minutes before expiry to avoid edge cases
     private static final long TOKEN_REFRESH_MARGIN_SECONDS = 300;
 
+    // Content-ID for embedded signature image
+    private static final String SIGNATURE_IMAGE_CID = "signature-logo";
+
     private final AccountConfig config;
     private final Parser markdownParser;
     private final HtmlRenderer htmlRenderer;
@@ -653,31 +656,79 @@ public class EmailClient implements IEmailClient {
                     message.setHeader("References", references);
                 }
 
-                // Compose body with signature and footer
-                String composedBody = composeEmailBody(body, includeSignature);
+                // Compose body with signature and footer (returns HTML)
+                String htmlBody = composeEmailBody(body, includeSignature);
 
-                // Body - detect format and convert if needed
-                String htmlBody = convertToHtml(composedBody);
+                // Determine if we need multipart/related (embedded image)
+                boolean needsRelated = includeSignature && hasSignatureImage();
+                boolean hasAttachments = attachments != null && !attachments.isEmpty();
 
-                // Build message content
-                if (attachments != null && !attachments.isEmpty()) {
-                    Multipart multipart = new MimeMultipart();
+                if (!needsRelated && !hasAttachments) {
+                    // Simple case: HTML only
+                    message.setContent(htmlBody, "text/html; charset=utf-8");
 
-                    // Body part
-                    MimeBodyPart textPart = new MimeBodyPart();
-                    textPart.setContent(htmlBody, "text/html; charset=utf-8");
-                    multipart.addBodyPart(textPart);
+                } else if (needsRelated && !hasAttachments) {
+                    // Case: embedded image, no attachments
+                    MimeMultipart related = new MimeMultipart("related");
 
-                    // Attachment parts
+                    // HTML body
+                    MimeBodyPart htmlPart = new MimeBodyPart();
+                    htmlPart.setContent(htmlBody, "text/html; charset=utf-8");
+                    related.addBodyPart(htmlPart);
+
+                    // Signature image
+                    MimeBodyPart imagePart = createSignatureImagePart();
+                    if (imagePart != null) {
+                        related.addBodyPart(imagePart);
+                    }
+
+                    message.setContent(related);
+
+                } else if (!needsRelated && hasAttachments) {
+                    // Case: attachments, no embedded image
+                    MimeMultipart mixed = new MimeMultipart("mixed");
+
+                    MimeBodyPart htmlPart = new MimeBodyPart();
+                    htmlPart.setContent(htmlBody, "text/html; charset=utf-8");
+                    mixed.addBodyPart(htmlPart);
+
                     for (String filePath : attachments) {
                         MimeBodyPart attachPart = new MimeBodyPart();
                         attachPart.attachFile(new File(filePath));
-                        multipart.addBodyPart(attachPart);
+                        mixed.addBodyPart(attachPart);
                     }
 
-                    message.setContent(multipart);
+                    message.setContent(mixed);
+
                 } else {
-                    message.setContent(htmlBody, "text/html; charset=utf-8");
+                    // Full case: embedded image + attachments
+                    MimeMultipart mixed = new MimeMultipart("mixed");
+
+                    // Create related for body + image
+                    MimeMultipart related = new MimeMultipart("related");
+
+                    MimeBodyPart htmlPart = new MimeBodyPart();
+                    htmlPart.setContent(htmlBody, "text/html; charset=utf-8");
+                    related.addBodyPart(htmlPart);
+
+                    MimeBodyPart imagePart = createSignatureImagePart();
+                    if (imagePart != null) {
+                        related.addBodyPart(imagePart);
+                    }
+
+                    // Wrap related in a bodypart for mixed
+                    MimeBodyPart relatedWrapper = new MimeBodyPart();
+                    relatedWrapper.setContent(related);
+                    mixed.addBodyPart(relatedWrapper);
+
+                    // Add attachments
+                    for (String filePath : attachments) {
+                        MimeBodyPart attachPart = new MimeBodyPart();
+                        attachPart.attachFile(new File(filePath));
+                        mixed.addBodyPart(attachPart);
+                    }
+
+                    message.setContent(mixed);
                 }
 
                 message.setSentDate(new Date());
@@ -708,27 +759,117 @@ public class EmailClient implements IEmailClient {
     }
 
     /**
-     * Composes the final email body by appending signature and footer as needed.
+     * Composes the final email body as HTML by appending signature and footer as needed.
      *
      * @param body             Original email body
      * @param includeSignature Whether to include account signature
-     * @return Composed body with signature and footer
+     * @return Composed HTML body with signature and footer
      */
     private String composeEmailBody(String body, boolean includeSignature) {
-        StringBuilder finalBody = new StringBuilder(body);
+        // Convert body to HTML first
+        String htmlBody = convertToHtml(body);
 
-        // Add signature if exists and enabled
-        String signature = config.getSignature();
-        if (includeSignature && signature != null && !signature.isBlank()) {
-            finalBody.append("\n\n").append(signature);
+        StringBuilder finalHtml = new StringBuilder();
+        finalHtml.append("<div class=\"email-body\">\n");
+        finalHtml.append(htmlBody);
+        finalHtml.append("\n</div>\n");
+
+        // Add signature if enabled
+        if (includeSignature) {
+            String signatureHtml = composeSignatureHtml();
+            if (!signatureHtml.isEmpty()) {
+                finalHtml.append("\n").append(signatureHtml);
+            }
         }
 
         // Add footer if enabled
         if (config.isIncludeFooter()) {
-            finalBody.append("\n\n--\nSent vía ultraPRO");
+            finalHtml.append("\n<div class=\"footer\" style=\"margin-top:20px;padding-top:10px;");
+            finalHtml.append("border-top:1px solid #ccc;color:#666;font-size:12px;\">\n");
+            finalHtml.append("Sent vía ultraPRO\n");
+            finalHtml.append("</div>\n");
         }
 
-        return finalBody.toString();
+        return finalHtml.toString();
+    }
+
+    /**
+     * Composes the signature HTML with embedded image reference if configured.
+     *
+     * @return HTML of signature with CID reference, or empty string if no signature
+     */
+    private String composeSignatureHtml() {
+        String signature = config.getSignature();
+        String imagePath = config.getSignatureImagePath();
+
+        if (signature == null && imagePath == null) {
+            return "";
+        }
+
+        StringBuilder html = new StringBuilder();
+
+        // Text signature
+        if (signature != null && !signature.isBlank()) {
+            // Convert signature text to HTML (respect line breaks)
+            String sigHtml = signature.replace("\n", "<br>\n");
+            html.append("<div class=\"signature\">\n");
+            html.append(sigHtml);
+            html.append("\n</div>\n");
+        }
+
+        // Signature image (CID reference)
+        if (imagePath != null && !imagePath.isBlank()) {
+            html.append("<div class=\"signature-logo\">\n");
+            html.append("<img src=\"cid:").append(SIGNATURE_IMAGE_CID).append("\" alt=\"\">\n");
+            html.append("</div>\n");
+        }
+
+        return html.toString();
+    }
+
+    /**
+     * Checks if a signature image is configured and exists.
+     */
+    private boolean hasSignatureImage() {
+        String path = config.getSignatureImagePath();
+        if (path == null || path.isBlank()) {
+            return false;
+        }
+        return Files.exists(Path.of(path));
+    }
+
+    /**
+     * Creates MimeBodyPart with signature image and Content-ID for embedding.
+     *
+     * @return MimeBodyPart with embedded image, or null if image not available
+     */
+    private MimeBodyPart createSignatureImagePart() throws MessagingException, IOException {
+        String imagePath = config.getSignatureImagePath();
+        if (imagePath == null) {
+            return null;
+        }
+
+        Path path = Path.of(imagePath);
+        if (!Files.exists(path)) {
+            logger.warn("Signature image not found: {}", imagePath);
+            return null;
+        }
+
+        MimeBodyPart imagePart = new MimeBodyPart();
+
+        // Detect MIME type
+        String mimeType = Files.probeContentType(path);
+        if (mimeType == null) {
+            mimeType = "image/png";  // Default
+        }
+
+        // Attach image
+        imagePart.attachFile(path.toFile());
+        imagePart.setContentID("<" + SIGNATURE_IMAGE_CID + ">");
+        imagePart.setDisposition(MimeBodyPart.INLINE);
+        imagePart.setHeader("Content-Type", mimeType);
+
+        return imagePart;
     }
 
     private String convertToHtml(String body) {

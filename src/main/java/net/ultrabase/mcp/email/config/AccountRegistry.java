@@ -257,14 +257,16 @@ public class AccountRegistry {
     }
 
     /**
-     * Updates an account's signature and footer settings.
+     * Updates an account's signature, footer, and signature image settings.
      *
-     * @param accountName   Account name
-     * @param signature     New signature (null to skip, empty string to remove)
-     * @param includeFooter Whether to include ultraPRO footer (null to skip)
+     * @param accountName        Account name
+     * @param signature          New signature (null to skip, empty string to remove)
+     * @param includeFooter      Whether to include ultraPRO footer (null to skip)
+     * @param signatureImagePath Path to signature image (null to skip, empty string to remove)
      * @return true if updated, false if account not found
      */
-    public boolean updateAccountSignature(String accountName, String signature, Boolean includeFooter) {
+    public boolean updateAccountSignature(String accountName, String signature,
+                                           Boolean includeFooter, String signatureImagePath) {
         AccountConfig config = accounts.get(accountName);
         if (config == null) {
             return false;
@@ -276,6 +278,10 @@ public class AccountRegistry {
 
         if (includeFooter != null) {
             config.setIncludeFooter(includeFooter);
+        }
+
+        if (signatureImagePath != null) {
+            config.setSignatureImagePath(signatureImagePath.isEmpty() ? null : signatureImagePath);
         }
 
         return true;
