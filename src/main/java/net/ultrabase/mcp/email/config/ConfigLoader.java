@@ -309,6 +309,11 @@ public class ConfigLoader {
         Integer cacheTtl = (Integer) data.get("status_cache_ttl");
         config.setStatusCacheTtl(cacheTtl);
 
+        // Signature settings
+        config.setSignature((String) data.get("signature"));
+        config.setIncludeFooter(getBoolean(data, "include_footer", true));
+        config.setSignatureImagePath((String) data.get("signature_image_path"));
+
         return config;
     }
 
@@ -378,6 +383,15 @@ public class ConfigLoader {
         data.put("include_in_status", config.isIncludeInStatus());
         if (config.getStatusCacheTtl() != null) {
             data.put("status_cache_ttl", config.getStatusCacheTtl());
+        }
+
+        // Signature settings
+        if (config.getSignature() != null) {
+            data.put("signature", config.getSignature());
+        }
+        data.put("include_footer", config.isIncludeFooter());
+        if (config.getSignatureImagePath() != null) {
+            data.put("signature_image_path", config.getSignatureImagePath());
         }
 
         return data;
