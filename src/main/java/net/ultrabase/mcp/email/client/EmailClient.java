@@ -15,6 +15,8 @@ import jakarta.mail.*;
 import jakarta.mail.internet.*;
 import jakarta.mail.search.*;
 import net.ultrabase.mcp.email.config.AccountConfig;
+import org.commonmark.Extension;
+import org.commonmark.ext.gfm.tables.TablesExtension;
 import org.commonmark.node.Node;
 import org.commonmark.parser.Parser;
 import org.commonmark.renderer.html.HtmlRenderer;
@@ -64,8 +66,10 @@ public class EmailClient implements IEmailClient {
     public EmailClient(AccountConfig config, Runnable onTokenRefreshed) {
         this.config = config;
         this.onTokenRefreshed = onTokenRefreshed;
-        this.markdownParser = Parser.builder().build();
-        this.htmlRenderer = HtmlRenderer.builder().build();
+        // Enable GFM tables extension for Markdown conversion
+        List<Extension> extensions = List.of(TablesExtension.create());
+        this.markdownParser = Parser.builder().extensions(extensions).build();
+        this.htmlRenderer = HtmlRenderer.builder().extensions(extensions).build();
     }
 
     @Override
@@ -966,16 +970,43 @@ public class EmailClient implements IEmailClient {
             return body;
         }
 
-        // Try to detect Markdown
+        // Try to detect Markdown (including GFM tables with |)
         if (body.contains("**") || body.contains("##") || body.contains("```")
-            || body.contains("- ") || body.contains("* ")) {
+            || body.contains("- ") || body.contains("* ") || body.contains("|")) {
             // Looks like Markdown, convert to HTML
             Node document = markdownParser.parse(body);
-            return htmlRenderer.render(document);
+            String html = htmlRenderer.render(document);
+            // Apply professional table styling
+            return applyTableStyles(html);
         }
 
         // Plain text - convert newlines to <br>
         return body.replace("\n", "<br>\n");
+    }
+
+    /**
+     * Applies minimal zen-style inline CSS to HTML tables.
+     * Clean, unobtrusive: just horizontal lines, no heavy backgrounds.
+     */
+    private String applyTableStyles(String html) {
+        if (!html.contains("<table>")) {
+            return html;
+        }
+
+        // Table: minimal, no outer borders
+        html = html.replace("<table>",
+            "<table style=\"border-collapse: collapse; margin: 12px 0; font-size: inherit;\">");
+
+        // Header cells: just bold with subtle bottom line
+        html = html.replace("<th>",
+            "<th style=\"padding: 6px 12px 6px 0; text-align: left; font-weight: 600; " +
+            "border-bottom: 1px solid #999;\">");
+
+        // Regular cells: light bottom border only
+        html = html.replace("<td>",
+            "<td style=\"padding: 6px 12px 6px 0; border-bottom: 1px solid #ddd;\">");
+
+        return html;
     }
 
     @Override
