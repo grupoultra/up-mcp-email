@@ -45,6 +45,9 @@ public class OAuthManager {
     private static final String REDIRECT_URI = "http://localhost:8089/oauth/callback";
     private static final int CALLBACK_PORT = 8089;
 
+    // Track active server to ensure cleanup between consecutive calls
+    private static volatile HttpServer activeServer;
+
     /**
      * OAuth tokens container.
      */
@@ -64,6 +67,15 @@ public class OAuthManager {
      * @throws OAuthException if authorization fails
      */
     public static OAuthTokens authorize(String clientId, String clientSecret) throws OAuthException {
+        // Stop any lingering server from a previous call
+        if (activeServer != null) {
+            try {
+                activeServer.stop(0);
+                logger.debug("Stopped lingering OAuth callback server");
+            } catch (Exception ignored) {}
+            activeServer = null;
+        }
+
         CompletableFuture<String> authCodeFuture = new CompletableFuture<>();
         HttpServer server = null;
 
@@ -115,6 +127,7 @@ public class OAuthManager {
 
             server.setExecutor(null);
             server.start();
+            activeServer = server;
             logger.info("OAuth callback server started on port {}", CALLBACK_PORT);
 
             // Build authorization URL
@@ -150,7 +163,8 @@ public class OAuthManager {
             throw new OAuthException("OAuth authorization failed: " + e.getMessage(), e);
         } finally {
             if (server != null) {
-                server.stop(1);
+                server.stop(0);
+                activeServer = null;
             }
         }
     }
