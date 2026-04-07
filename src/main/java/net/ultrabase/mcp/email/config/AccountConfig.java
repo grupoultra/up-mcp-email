@@ -79,6 +79,9 @@ public class AccountConfig {
     private boolean includeFooter = true;  // Include "Sent vía ultraPRO" footer (default: true)
     private String signatureImagePath;  // Absolute path to signature logo image (nullable)
 
+    // Default From address override (nullable - uses emailAddress if not set)
+    private String defaultFromAddress;
+
     public AccountConfig() {}
 
     public AccountConfig(String accountName, String emailAddress) {
@@ -302,6 +305,14 @@ public class AccountConfig {
         this.signatureImagePath = signatureImagePath;
     }
 
+    public String getDefaultFromAddress() {
+        return defaultFromAddress;
+    }
+
+    public void setDefaultFromAddress(String defaultFromAddress) {
+        this.defaultFromAddress = defaultFromAddress;
+    }
+
     /**
      * Returns true if this account uses OAuth2 authentication.
      */
@@ -340,6 +351,7 @@ public class AccountConfig {
         masked.signature = this.signature;
         masked.includeFooter = this.includeFooter;
         masked.signatureImagePath = this.signatureImagePath;
+        masked.defaultFromAddress = this.defaultFromAddress;
         return masked;
     }
 

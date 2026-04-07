@@ -8,6 +8,7 @@ package net.ultrabase.mcp.email.tool.account;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import net.ultrabase.mcp.email.config.AccountConfig;
 import net.ultrabase.mcp.email.tool.BaseTool;
 import net.ultrabase.mcp.email.tool.ToolContext;
 
@@ -66,7 +67,8 @@ public class UpdateEmailAccount extends BaseTool {
             "new_account_name", "string", "New account alias/name. Use to rename the account identifier. (optional)",
             "signature", "string", "Personal signature for emails (optional, set empty string to remove)",
             "include_footer", "boolean", "Include 'Sent vía ultraPRO' footer (optional)",
-            "signature_image", "string", "Absolute path to signature logo image (optional, set empty to remove)"
+            "signature_image", "string", "Absolute path to signature logo image (optional, set empty to remove)",
+            "default_from_address", "string", "Default From address for sent emails. Use for sending as an alias. Set empty string to remove. (optional)"
         );
     }
 
@@ -121,15 +123,19 @@ public class UpdateEmailAccount extends BaseTool {
                 }
             }
 
+            // Default From address
+            boolean hasDefaultFromAddress = args.containsKey("default_from_address");
+            String defaultFromAddress = hasDefaultFromAddress ? getString(args, "default_from_address", "") : null;
+
             boolean hasPassword = password != null && !password.isEmpty();
             boolean hasFullName = fullName != null && !fullName.isEmpty();
             boolean hasNewName = newAccountName != null && !newAccountName.isEmpty();
 
             if (!hasPassword && !hasFullName && !hasNewName && !hasSignature
-                    && !hasIncludeFooter && !hasSignatureImage) {
+                    && !hasIncludeFooter && !hasSignatureImage && !hasDefaultFromAddress) {
                 throw new IllegalArgumentException(
                     "At least one of 'password', 'full_name', 'new_account_name', 'signature', " +
-                    "'include_footer', or 'signature_image' must be provided");
+                    "'include_footer', 'signature_image', or 'default_from_address' must be provided");
             }
 
             List<String> updatedFields = new ArrayList<>();
@@ -191,6 +197,18 @@ public class UpdateEmailAccount extends BaseTool {
                     } else {
                         updatedFields.add("signature_image='" + signatureImagePath + "'");
                     }
+                }
+            }
+
+            // Handle default_from_address update
+            if (hasDefaultFromAddress) {
+                AccountConfig config = context.accountRegistry().getAccount(finalAccountName);
+                if (defaultFromAddress.isEmpty()) {
+                    config.setDefaultFromAddress(null);
+                    updatedFields.add("default_from_address removed");
+                } else {
+                    config.setDefaultFromAddress(defaultFromAddress);
+                    updatedFields.add("default_from_address='" + defaultFromAddress + "'");
                 }
             }
 

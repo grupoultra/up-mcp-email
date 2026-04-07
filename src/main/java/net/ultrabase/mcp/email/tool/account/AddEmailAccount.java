@@ -65,7 +65,8 @@ public class AddEmailAccount extends BaseTool {
             "\"imap_host\":{\"type\":\"string\",\"description\":\"IMAP server host (required for non-Gmail accounts)\"}," +
             "\"imap_port\":{\"type\":\"integer\",\"description\":\"IMAP server port (default: 993)\"}," +
             "\"smtp_host\":{\"type\":\"string\",\"description\":\"SMTP server host (required for non-Gmail accounts)\"}," +
-            "\"smtp_port\":{\"type\":\"integer\",\"description\":\"SMTP server port (default: 465)\"}" +
+            "\"smtp_port\":{\"type\":\"integer\",\"description\":\"SMTP server port (default: 465)\"}," +
+            "\"default_from_address\":{\"type\":\"string\",\"description\":\"Default From address for sent emails. Use when the account authenticates with one address but should send as an alias (optional)\"}" +
             "},\"required\":[\"email_address\"]}";
     }
 
@@ -75,6 +76,7 @@ public class AddEmailAccount extends BaseTool {
             String emailAddress = getString(args, "email_address");
             String accountName = getString(args, "account_name", emailAddress);
             String fullName = getString(args, "full_name", null);
+            String defaultFromAddress = getString(args, "default_from_address", null);
 
             // Default full name from email prefix
             if (fullName == null || fullName.isEmpty()) {
@@ -101,14 +103,14 @@ public class AddEmailAccount extends BaseTool {
 
             // Detect Google (Gmail or Workspace) and handle accordingly
             if (OAuthManager.isGoogleEmail(emailAddress)) {
-                return addGmailAccountOAuth(emailAddress, accountName, fullName);
+                return addGmailAccountOAuth(emailAddress, accountName, fullName, defaultFromAddress);
             } else {
-                return addGenericEmailAccount(args, emailAddress, accountName, fullName);
+                return addGenericEmailAccount(args, emailAddress, accountName, fullName, defaultFromAddress);
             }
         });
     }
 
-    private ObjectNode addGmailAccountOAuth(String emailAddress, String accountName, String fullName) {
+    private ObjectNode addGmailAccountOAuth(String emailAddress, String accountName, String fullName, String defaultFromAddress) {
         logger.info("Adding Gmail account with OAuth2: {}", emailAddress);
 
         // Get OAuth credentials
@@ -150,6 +152,9 @@ public class AddEmailAccount extends BaseTool {
             }
             config.setOauthTokenExpiry(tokens.expiry());
             config.setOauthTokensInVault(tokensStoredSecurely);
+            if (defaultFromAddress != null && !defaultFromAddress.isEmpty()) {
+                config.setDefaultFromAddress(defaultFromAddress);
+            }
 
             // Add and save
             context.accountRegistry().addAccount(config);
@@ -175,7 +180,7 @@ public class AddEmailAccount extends BaseTool {
     }
 
     private ObjectNode addGenericEmailAccount(Map<String, Object> args, String emailAddress,
-                                               String accountName, String fullName) {
+                                               String accountName, String fullName, String defaultFromAddress) {
         logger.info("Adding generic email account: {}", emailAddress);
 
         // Validate required fields for non-Gmail
@@ -208,6 +213,9 @@ public class AddEmailAccount extends BaseTool {
         config.setSmtpSsl(true);
         config.setSmtpPassword(password);
         config.setSmtpAuthMethod(AccountConfig.AuthMethod.PASSWORD);
+        if (defaultFromAddress != null && !defaultFromAddress.isEmpty()) {
+            config.setDefaultFromAddress(defaultFromAddress);
+        }
 
         // Add and save
         context.accountRegistry().addAccount(config);

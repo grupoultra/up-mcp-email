@@ -48,7 +48,8 @@ public class SendEmail extends BaseTool {
             "attachments", "array:string", "A list of absolute file paths to attach to the email (optional)",
             "in_reply_to", "string", "Message-ID of the email being replied to. Enables proper threading. (optional)",
             "references", "string", "Space-separated Message-IDs for the thread chain. Usually includes in_reply_to plus ancestors. (optional)",
-            "include_signature", "boolean", "Include account signature in email (default: true)"
+            "include_signature", "boolean", "Include account signature in email (default: true)",
+            "from_address", "string", "Override From address. Use when sending from an alias authorized on the same SMTP server. Authentication uses account credentials. (optional)"
         );
     }
 
@@ -75,13 +76,15 @@ public class SendEmail extends BaseTool {
         String inReplyTo = getString(args, "in_reply_to", null);
         String references = getString(args, "references", null);
         boolean includeSignature = getBoolean(args, "include_signature", true);
+        String fromAddress = getString(args, "from_address", null);
 
         return context.emailClient(accountName).sendEmail(
             recipients, subject, body,
             cc.isEmpty() ? null : cc,
             bcc.isEmpty() ? null : bcc,
             attachments.isEmpty() ? null : attachments,
-            inReplyTo, references, includeSignature
+            inReplyTo, references, includeSignature,
+            fromAddress
         );
     }
 }

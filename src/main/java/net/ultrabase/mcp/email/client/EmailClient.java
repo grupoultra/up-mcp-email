@@ -673,14 +673,22 @@ public class EmailClient implements IEmailClient {
     @Override
     public CompletableFuture<JsonNode> sendEmail(List<String> recipients, String subject, String body,
                                                   List<String> cc, List<String> bcc, List<String> attachments,
-                                                  String inReplyTo, String references, boolean includeSignature) {
+                                                  String inReplyTo, String references, boolean includeSignature,
+                                                  String fromAddressOverride) {
         return CompletableFuture.supplyAsync(() -> {
             try {
                 Session session = getSmtpSession();
                 MimeMessage message = new MimeMessage(session);
 
-                // From
-                String fromAddress = config.getEmailAddress();
+                // From: explicit override > account default_from_address > account email
+                String fromAddress;
+                if (fromAddressOverride != null && !fromAddressOverride.isEmpty()) {
+                    fromAddress = fromAddressOverride;
+                } else if (config.getDefaultFromAddress() != null && !config.getDefaultFromAddress().isEmpty()) {
+                    fromAddress = config.getDefaultFromAddress();
+                } else {
+                    fromAddress = config.getEmailAddress();
+                }
                 String fromName = config.getFullName();
                 if (fromName != null && !fromName.isEmpty()) {
                     message.setFrom(new InternetAddress(fromAddress, fromName));

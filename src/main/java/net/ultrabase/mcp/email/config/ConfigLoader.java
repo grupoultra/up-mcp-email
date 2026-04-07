@@ -314,6 +314,9 @@ public class ConfigLoader {
         config.setIncludeFooter(getBoolean(data, "include_footer", true));
         config.setSignatureImagePath((String) data.get("signature_image_path"));
 
+        // Default From address
+        config.setDefaultFromAddress((String) data.get("default_from_address"));
+
         return config;
     }
 
@@ -392,6 +395,11 @@ public class ConfigLoader {
         data.put("include_footer", config.isIncludeFooter());
         if (config.getSignatureImagePath() != null) {
             data.put("signature_image_path", config.getSignatureImagePath());
+        }
+
+        // Default From address
+        if (config.getDefaultFromAddress() != null) {
+            data.put("default_from_address", config.getDefaultFromAddress());
         }
 
         return data;

@@ -104,11 +104,13 @@ public interface IEmailClient {
      * @param inReplyTo        Message-ID being replied to (optional)
      * @param references       Thread Message-IDs (optional)
      * @param includeSignature Whether to include account signature (default: true)
+     * @param fromAddress      Override From address (optional, uses account email if null)
      * @return Send result
      */
     CompletableFuture<JsonNode> sendEmail(List<String> recipients, String subject, String body,
                                            List<String> cc, List<String> bcc, List<String> attachments,
-                                           String inReplyTo, String references, boolean includeSignature);
+                                           String inReplyTo, String references, boolean includeSignature,
+                                           String fromAddress);
 
     /**
      * Marks emails as read.
