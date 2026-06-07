@@ -13,6 +13,7 @@ import io.modelcontextprotocol.server.McpServer;
 import io.modelcontextprotocol.server.McpSyncServer;
 import io.modelcontextprotocol.server.transport.StdioServerTransportProvider;
 import io.modelcontextprotocol.spec.McpSchema.ServerCapabilities;
+import net.ultrabase.mcp.email.client.TokenKeepAlive;
 import net.ultrabase.mcp.email.config.AccountRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,6 +29,11 @@ public class Main {
     private static final String VERSION = "1.0.0";
 
     public static void main(String[] args) {
+        // Jakarta/Angus Mail reads these as System properties: decode RFC 2047/2231
+        // encoded and folded attachment filenames so getFileName() is consistent.
+        System.setProperty("mail.mime.decodefilename", "true");
+        System.setProperty("mail.mime.decodeparameters", "true");
+
         if (args.length > 0 && ("--help".equals(args[0]) || "-h".equals(args[0]))) {
             printUsage();
             System.exit(0);
@@ -84,6 +90,16 @@ public class Main {
                 .build();
 
             logger.info("MCP server started on stdio with {} tools", emailServer.getToolCount());
+
+            // Start background keep-alive so OAuth tokens stay fresh between tool calls
+            TokenKeepAlive keepAlive = new TokenKeepAlive(accountRegistry);
+            keepAlive.start();
+
+            // Stop the keep-alive cleanly when the gateway terminates the provider
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                logger.info("Shutting down up-mcp-email...");
+                keepAlive.stop();
+            }));
 
             // Block forever - the transport provider handles I/O in its own threads
             Thread.currentThread().join();

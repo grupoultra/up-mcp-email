@@ -59,12 +59,23 @@ public class SecretClient {
             return null;
         }
 
-        String gatewayUrl = System.getenv("ULTRAPRO_GATEWAY_URL");
-        if (gatewayUrl == null || gatewayUrl.isEmpty()) {
-            gatewayUrl = DEFAULT_GATEWAY_URL;
-        }
+        // The gateway injects the base URL as ULTRAPRO_API_URL; ULTRAPRO_GATEWAY_URL is
+        // accepted as a legacy alias. Fall back to localhost when neither is present.
+        String gatewayUrl = firstNonBlank(
+            System.getenv("ULTRAPRO_API_URL"),
+            System.getenv("ULTRAPRO_GATEWAY_URL"),
+            DEFAULT_GATEWAY_URL);
 
         return new SecretClient(gatewayUrl, providerId, apiToken);
+    }
+
+    private static String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return DEFAULT_GATEWAY_URL;
     }
 
     /**

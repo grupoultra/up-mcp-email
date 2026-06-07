@@ -81,14 +81,16 @@ public interface IEmailClient {
     CompletableFuture<JsonNode> listFolders();
 
     /**
-     * Downloads an email attachment.
+     * Downloads an email attachment, selected by index (preferred) or by filename.
      *
-     * @param emailId        Email ID
-     * @param attachmentName Attachment filename
-     * @param savePath       Path to save the attachment
+     * @param emailId         Email ID
+     * @param attachmentName  Attachment filename (nullable; tolerant match)
+     * @param attachmentIndex 0-based attachment index from the listing (nullable; takes precedence)
+     * @param savePath        Path to save the attachment
      * @return Download result
      */
-    CompletableFuture<JsonNode> downloadAttachment(String emailId, String attachmentName, String savePath);
+    CompletableFuture<JsonNode> downloadAttachment(String emailId, String attachmentName,
+                                                   Integer attachmentIndex, String savePath);
 
     // ==================== Email Writing ====================
 
@@ -178,4 +180,18 @@ public interface IEmailClient {
      * @return Account status
      */
     CompletableFuture<JsonNode> getStatus();
+
+    // ==================== Token Keep-Alive ====================
+
+    /**
+     * Proactively refreshes the OAuth2 access token if it is within {@code marginSeconds}
+     * of expiry. No-op for password accounts or when no expiry is known. Invoked by the
+     * background keep-alive sweep so tokens stay fresh (and the refresh token stays warm)
+     * even without inbound tool calls.
+     *
+     * @param marginSeconds refresh when the token expires within this many seconds
+     */
+    default void keepAliveRefresh(long marginSeconds) {
+        // Password-based implementations have nothing to refresh.
+    }
 }

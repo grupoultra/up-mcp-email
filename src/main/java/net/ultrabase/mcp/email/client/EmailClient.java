@@ -15,6 +15,7 @@ import jakarta.mail.*;
 import jakarta.mail.internet.*;
 import jakarta.mail.search.*;
 import net.ultrabase.mcp.email.config.AccountConfig;
+import net.ultrabase.mcp.email.gateway.TokenVault;
 import org.commonmark.Extension;
 import org.commonmark.ext.gfm.tables.TablesExtension;
 import org.commonmark.node.Node;
@@ -26,6 +27,8 @@ import org.slf4j.LoggerFactory;
 import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.text.Normalizer;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -54,6 +57,7 @@ public class EmailClient implements IEmailClient {
     private final Parser markdownParser;
     private final HtmlRenderer htmlRenderer;
     private final Runnable onTokenRefreshed;
+    private TokenVault tokenVault;
 
     private Session imapSession;
     private Session smtpSession;
@@ -106,6 +110,11 @@ public class EmailClient implements IEmailClient {
         props.put("mail.imaps.ssl.enable", String.valueOf(config.isImapSsl()));
         props.put("mail.imaps.connectiontimeout", "10000");
         props.put("mail.imaps.timeout", "30000");
+
+        // Decode RFC 2047/2231 encoded and folded attachment filenames consistently,
+        // so getFileName() reconstructs the same value the listing exposed.
+        props.put("mail.mime.decodefilename", "true");
+        props.put("mail.mime.decodeparameters", "true");
 
         if (config.isOAuth2()) {
             props.put("mail.imaps.auth.mechanisms", "XOAUTH2");
@@ -187,6 +196,29 @@ public class EmailClient implements IEmailClient {
         return token;
     }
 
+    @Override
+    public synchronized void keepAliveRefresh(long marginSeconds) {
+        if (!config.isOAuth2()) {
+            return;
+        }
+        Instant expiry = config.getOauthTokenExpiry();
+        if (expiry == null) {
+            return;
+        }
+        if (Instant.now().plusSeconds(marginSeconds).isAfter(expiry)) {
+            logger.info("[{}] Keep-alive: token within {}s of expiry, refreshing proactively",
+                config.getAccountName(), marginSeconds);
+            refreshOAuthToken();
+        }
+    }
+
+    private synchronized TokenVault tokenVault() {
+        if (tokenVault == null) {
+            tokenVault = TokenVault.fromEnvironment();
+        }
+        return tokenVault;
+    }
+
     private String refreshOAuthToken() {
         long startTime = System.currentTimeMillis();
         logger.info("[{}] Starting OAuth token refresh...", config.getAccountName());
@@ -216,10 +248,19 @@ public class EmailClient implements IEmailClient {
                 config.setOauthRefreshToken(newTokens.refreshToken());
             }
 
+            // Persist the refreshed secrets to the vault when this account is vault-backed,
+            // otherwise the next restart would re-hydrate the stale token.
+            if (config.isOauthTokensInVault()) {
+                if (!tokenVault().storeTokens(config.getAccountName(), newTokens)) {
+                    logger.warn("[{}] Refreshed token could not be written to the vault; "
+                        + "it may not survive a restart", config.getAccountName());
+                }
+            }
+
             long totalElapsed = System.currentTimeMillis() - startTime;
             logger.info("[{}] OAuth2 token refreshed successfully in {}ms", config.getAccountName(), totalElapsed);
 
-            // Notify caller to save (if callback provided)
+            // Notify caller to save (persists expiry + non-secret fields to config)
             if (onTokenRefreshed != null) {
                 onTokenRefreshed.run();
             }
@@ -495,20 +536,16 @@ public class EmailClient implements IEmailClient {
     }
 
     private void extractAttachments(Part part, ArrayNode attachments) throws MessagingException, IOException {
-        if (part.isMimeType("multipart/*")) {
-            Multipart mp = (Multipart) part.getContent();
-            for (int i = 0; i < mp.getCount(); i++) {
-                BodyPart bp = mp.getBodyPart(i);
-                String disposition = bp.getDisposition();
-                if (disposition != null && disposition.equalsIgnoreCase(Part.ATTACHMENT)) {
-                    ObjectNode att = objectMapper.createObjectNode();
-                    att.put("filename", bp.getFileName());
-                    att.put("content_type", bp.getContentType());
-                    att.put("size_bytes", bp.getSize());
-                    attachments.add(att);
-                }
-                extractAttachments(bp, attachments);
-            }
+        List<Part> parts = collectAttachmentParts(part);
+        for (int i = 0; i < parts.size(); i++) {
+            Part bp = parts.get(i);
+            ObjectNode att = objectMapper.createObjectNode();
+            // Stable selector for download_attachment, robust to fragile/encoded filenames.
+            att.put("attachment_index", i);
+            att.put("filename", bp.getFileName());
+            att.put("content_type", bp.getContentType());
+            att.put("size_bytes", bp.getSize());
+            attachments.add(att);
         }
     }
 
@@ -613,7 +650,8 @@ public class EmailClient implements IEmailClient {
     }
 
     @Override
-    public CompletableFuture<JsonNode> downloadAttachment(String emailId, String attachmentName, String savePath) {
+    public CompletableFuture<JsonNode> downloadAttachment(String emailId, String attachmentName,
+                                                          Integer attachmentIndex, String savePath) {
         return CompletableFuture.supplyAsync(() -> {
             try {
                 Folder folder = openFolder("INBOX", Folder.READ_ONLY);
@@ -621,19 +659,66 @@ public class EmailClient implements IEmailClient {
                     int msgNum = Integer.parseInt(emailId);
                     Message msg = folder.getMessage(msgNum);
 
-                    // Find and save the attachment
-                    boolean found = saveAttachment(msg, attachmentName, savePath);
+                    // Collect attachments in the same order as the listing, so indices align.
+                    List<Part> parts = collectAttachmentParts(msg);
 
-                    ObjectNode result = objectMapper.createObjectNode();
-                    result.put("success", found);
-                    result.put("email_id", emailId);
-                    result.put("attachment_name", attachmentName);
-                    result.put("save_path", savePath);
+                    Part chosen = null;
+                    String matchedBy = null;
 
-                    if (!found) {
-                        result.put("error", "Attachment not found: " + attachmentName);
+                    // 1. Explicit index wins — robust against fragile/encoded filenames.
+                    if (attachmentIndex != null && attachmentIndex >= 0 && attachmentIndex < parts.size()) {
+                        chosen = parts.get(attachmentIndex);
+                        matchedBy = "index";
                     }
 
+                    // 2. Robust name match (decode + NFC + collapse whitespace + case-insensitive).
+                    if (chosen == null && attachmentName != null && !attachmentName.isEmpty()) {
+                        String want = normalizeFilename(attachmentName);
+                        for (Part p : parts) {
+                            if (normalizeFilename(p.getFileName()).equalsIgnoreCase(want)) {
+                                chosen = p;
+                                matchedBy = "name";
+                                break;
+                            }
+                        }
+                    }
+
+                    // 3. Single-attachment fallback: unambiguous, so honour it.
+                    if (chosen == null && parts.size() == 1) {
+                        chosen = parts.get(0);
+                        matchedBy = "single";
+                    }
+
+                    ObjectNode result = objectMapper.createObjectNode();
+
+                    if (chosen == null) {
+                        // Actionable error: list what is actually available.
+                        ArrayNode available = result.putArray("available_attachments");
+                        for (int i = 0; i < parts.size(); i++) {
+                            ObjectNode a = objectMapper.createObjectNode();
+                            a.put("attachment_index", i);
+                            a.put("filename", parts.get(i).getFileName());
+                            available.add(a);
+                        }
+                        String requested = attachmentIndex != null
+                            ? ("index " + attachmentIndex)
+                            : ("\"" + attachmentName + "\"");
+                        result.put("success", false);
+                        result.put("email_id", emailId);
+                        result.put("error", "Attachment not found: " + requested
+                            + ". Use one of the attachment_index values in available_attachments.");
+                        return result;
+                    }
+
+                    try (InputStream is = chosen.getInputStream()) {
+                        Files.copy(is, Path.of(savePath), StandardCopyOption.REPLACE_EXISTING);
+                    }
+
+                    result.put("success", true);
+                    result.put("email_id", emailId);
+                    result.put("attachment_name", chosen.getFileName());
+                    result.put("matched_by", matchedBy);
+                    result.put("save_path", savePath);
                     return result;
                 } finally {
                     folder.close(false);
@@ -645,27 +730,59 @@ public class EmailClient implements IEmailClient {
         });
     }
 
-    private boolean saveAttachment(Part part, String filename, String savePath)
-            throws MessagingException, IOException {
-        if (part.isMimeType("multipart/*")) {
-            Multipart mp = (Multipart) part.getContent();
-            for (int i = 0; i < mp.getCount(); i++) {
-                BodyPart bp = mp.getBodyPart(i);
-                String disposition = bp.getDisposition();
-                if (disposition != null && disposition.equalsIgnoreCase(Part.ATTACHMENT)) {
-                    if (filename.equals(bp.getFileName())) {
-                        try (InputStream is = bp.getInputStream()) {
-                            Files.copy(is, Path.of(savePath));
-                        }
-                        return true;
-                    }
-                }
-                if (saveAttachment(bp, filename, savePath)) {
-                    return true;
-                }
+    /**
+     * Collects attachment parts in document order. Used by both listing and download so
+     * that {@code attachment_index} refers to the same part in both. A part counts as an
+     * attachment when its disposition is ATTACHMENT, or — for senders that omit
+     * Content-Disposition — when it carries a filename.
+     */
+    private List<Part> collectAttachmentParts(Part part) throws MessagingException, IOException {
+        List<Part> result = new ArrayList<>();
+        collectAttachmentParts(part, result);
+        return result;
+    }
+
+    private void collectAttachmentParts(Part part, List<Part> out) throws MessagingException, IOException {
+        if (!part.isMimeType("multipart/*")) {
+            return;
+        }
+        Multipart mp = (Multipart) part.getContent();
+        for (int i = 0; i < mp.getCount(); i++) {
+            BodyPart bp = mp.getBodyPart(i);
+            if (isAttachmentPart(bp)) {
+                out.add(bp);
+            } else if (bp.isMimeType("multipart/*")) {
+                collectAttachmentParts(bp, out);
             }
         }
-        return false;
+    }
+
+    private boolean isAttachmentPart(Part part) throws MessagingException {
+        String disposition = part.getDisposition();
+        if (disposition != null && disposition.equalsIgnoreCase(Part.ATTACHMENT)) {
+            return true;
+        }
+        // Some senders omit Content-Disposition but still name the part via Content-Type.
+        return !part.isMimeType("multipart/*") && part.getFileName() != null;
+    }
+
+    /**
+     * Normalizes a filename for tolerant matching: MIME-decodes RFC 2047/2231 encoding,
+     * applies Unicode NFC, collapses runs of whitespace (folding artifacts) to a single
+     * space, and trims.
+     */
+    private static String normalizeFilename(String name) {
+        if (name == null) {
+            return "";
+        }
+        String decoded;
+        try {
+            decoded = jakarta.mail.internet.MimeUtility.decodeText(name);
+        } catch (Exception e) {
+            decoded = name;
+        }
+        decoded = Normalizer.normalize(decoded, Normalizer.Form.NFC);
+        return decoded.replaceAll("\\s+", " ").trim();
     }
 
     // ==================== Email Writing ====================

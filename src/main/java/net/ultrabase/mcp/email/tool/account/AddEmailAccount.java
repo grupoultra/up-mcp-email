@@ -10,7 +10,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import net.ultrabase.mcp.email.client.OAuthManager;
 import net.ultrabase.mcp.email.config.AccountConfig;
-import net.ultrabase.mcp.email.gateway.SecretClient;
+import net.ultrabase.mcp.email.gateway.TokenVault;
 import net.ultrabase.mcp.email.tool.BaseTool;
 import net.ultrabase.mcp.email.tool.ToolContext;
 import org.slf4j.Logger;
@@ -235,25 +235,13 @@ public class AddEmailAccount extends BaseTool {
     }
 
     private boolean storeOAuthTokens(String accountName, OAuthManager.OAuthTokens tokens) {
-        SecretClient client = SecretClient.fromEnvironment("email");
-        if (client == null) {
+        TokenVault vault = TokenVault.fromEnvironment();
+        if (!vault.isAvailable()) {
             logger.debug("Secret Management not available, tokens will be stored in config");
             return false;
         }
-
         try {
-            String safeName = accountName.replace("@", "_at_").replace(".", "_");
-            boolean success = true;
-            success &= client.storeSecret("OAUTH_ACCESS_TOKEN_" + safeName, tokens.accessToken());
-            success &= client.storeSecret("OAUTH_REFRESH_TOKEN_" + safeName, tokens.refreshToken());
-            success &= client.storeSecret("OAUTH_TOKEN_EXPIRY_" + safeName, tokens.expiry().toString());
-
-            if (success) {
-                logger.info("OAuth tokens stored securely for account '{}'", accountName);
-            } else {
-                logger.debug("Secret Management unavailable (HTTP 405), tokens will be stored in config");
-            }
-            return success;
+            return vault.storeTokens(accountName, tokens);
         } catch (Exception e) {
             logger.warn("Failed to store tokens via Secret Management: {}", e.getMessage());
             return false;

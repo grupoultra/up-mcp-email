@@ -40,7 +40,10 @@ public class DownloadAttachment extends BaseTool {
     public String getInputSchema() {
         return schema(
             "email_id", "string", "The email ID (obtained from list_emails_metadata or get_emails_content)",
-            "attachment_name", "string", "The name of the attachment to download (as shown in the attachments list)",
+            "attachment_index", "integer", "0-based index of the attachment as shown by get_emails_content "
+                + "(optional; preferred — robust to encoded/folded filenames)",
+            "attachment_name", "string", "The attachment filename as shown in the attachments list "
+                + "(optional; used when attachment_index is not provided)",
             "save_path", "string", "The absolute path where the attachment should be saved"
         );
     }
@@ -56,9 +59,27 @@ public class DownloadAttachment extends BaseTool {
         }
 
         String emailId = getString(args, "email_id");
-        String attachmentName = getString(args, "attachment_name");
         String savePath = getString(args, "save_path");
+        String attachmentName = getString(args, "attachment_name", null);
 
-        return context.emailClient(accountName).downloadAttachment(emailId, attachmentName, savePath);
+        Integer attachmentIndex = null;
+        Object idxRaw = args.get("attachment_index");
+        if (idxRaw instanceof Number) {
+            attachmentIndex = ((Number) idxRaw).intValue();
+        } else if (idxRaw instanceof String && !((String) idxRaw).isBlank()) {
+            try {
+                attachmentIndex = Integer.parseInt(((String) idxRaw).trim());
+            } catch (NumberFormatException ignored) {
+                // fall through to name-based matching
+            }
+        }
+
+        if (attachmentIndex == null && (attachmentName == null || attachmentName.isBlank())) {
+            throw new IllegalArgumentException(
+                "Provide either attachment_index (preferred) or attachment_name.");
+        }
+
+        return context.emailClient(accountName)
+            .downloadAttachment(emailId, attachmentName, attachmentIndex, savePath);
     }
 }

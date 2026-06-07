@@ -9,13 +9,15 @@ package net.ultrabase.mcp.email.config;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.moandjiezana.toml.Toml;
-import com.moandjiezana.toml.TomlWriter;
+import net.ultrabase.mcp.email.client.OAuthManager.OAuthTokens;
+import net.ultrabase.mcp.email.gateway.TokenVault;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.util.*;
 
@@ -44,31 +46,138 @@ public class ConfigLoader {
     public static AccountRegistry load() {
         AccountRegistry registry = new AccountRegistry();
 
-        // Try TOML first (preferred, compatible with Python)
-        if (Files.exists(CONFIG_FILE)) {
-            try {
-                loadFromToml(CONFIG_FILE, registry);
-                logger.info("Loaded configuration from {}", CONFIG_FILE);
-            } catch (Exception e) {
-                logger.warn("Failed to load TOML config: {}", e.getMessage());
-            }
-        }
-
-        // Try JSON as fallback
-        if (!registry.hasAccounts() && Files.exists(CONFIG_FILE_JSON)) {
+        // JSON is the canonical store. TOML is a legacy format kept only so existing
+        // installations migrate forward on first run.
+        boolean jsonCanonical = false;
+        if (Files.exists(CONFIG_FILE_JSON)) {
             try {
                 loadFromJson(CONFIG_FILE_JSON, registry);
                 logger.info("Loaded configuration from {}", CONFIG_FILE_JSON);
             } catch (Exception e) {
                 logger.warn("Failed to load JSON config: {}", e.getMessage());
             }
+            jsonCanonical = registry.hasAccounts();
+        }
+
+        // Fall back to (and migrate from) legacy TOML only when JSON yielded nothing.
+        boolean migratedFromToml = false;
+        if (!registry.hasAccounts() && Files.exists(CONFIG_FILE)) {
+            try {
+                loadFromToml(CONFIG_FILE, registry);
+                logger.info("Loaded legacy configuration from {}", CONFIG_FILE);
+            } catch (Exception e) {
+                logger.warn("Failed to load TOML config: {}", e.getMessage());
+            }
+            migratedFromToml = registry.hasAccounts();
         }
 
         if (!registry.hasAccounts()) {
             logger.info("No accounts configured in {}", CONFIG_DIR);
+            return registry;
+        }
+
+        // Reconcile OAuth tokens with the secure vault: hydrate vault-backed accounts
+        // and migrate any plaintext tokens into the vault.
+        boolean vaultChanged = reconcileVault(registry);
+
+        // Persist to canonical JSON whenever the in-memory registry diverged from disk.
+        boolean jsonPersisted = jsonCanonical;
+        if (migratedFromToml || vaultChanged) {
+            try {
+                save(registry);
+                jsonPersisted = true;
+            } catch (Exception e) {
+                logger.warn("Failed to persist reconciled configuration: {}", e.getMessage());
+            }
+        }
+
+        // Retire the legacy TOML only once the canonical JSON safely holds the data,
+        // so it can never shadow the JSON on a future start.
+        if (jsonPersisted && Files.exists(CONFIG_FILE)) {
+            retireLegacyTomlFile();
         }
 
         return registry;
+    }
+
+    /**
+     * Reconciles each OAuth account's tokens with the secure vault.
+     *
+     * <ul>
+     *   <li>Vault-backed accounts ({@code oauth_tokens_in_vault=true}) are hydrated
+     *       in-memory from the vault.</li>
+     *   <li>Legacy accounts that still carry plaintext tokens are migrated into the
+     *       vault (tokens stored securely, plaintext cleared, flag set).</li>
+     * </ul>
+     *
+     * @return true if the registry changed and should be persisted
+     */
+    private static boolean reconcileVault(AccountRegistry registry) {
+        TokenVault vault = TokenVault.fromEnvironment();
+        boolean changed = false;
+
+        for (AccountConfig config : registry.getAccounts()) {
+            if (!config.isOAuth2()) {
+                continue;
+            }
+            String name = config.getAccountName();
+
+            if (config.isOauthTokensInVault()) {
+                // Hydrate runtime token fields from the vault (not persisted to JSON).
+                OAuthTokens tokens = vault.loadTokens(name);
+                if (tokens != null) {
+                    config.setOauthAccessToken(tokens.accessToken());
+                    if (tokens.refreshToken() != null) {
+                        config.setOauthRefreshToken(tokens.refreshToken());
+                    }
+                    if (tokens.expiry() != null) {
+                        config.setOauthTokenExpiry(tokens.expiry());
+                    }
+                } else {
+                    logger.warn("Account '{}' marked as vault-backed but tokens could not be "
+                        + "loaded from Secret Management (vault unavailable or empty)", name);
+                }
+                continue;
+            }
+
+            // Legacy plaintext account: migrate into the vault if we have tokens and a vault.
+            if (vault.isAvailable()
+                && config.getOauthAccessToken() != null && !config.getOauthAccessToken().isEmpty()
+                && config.getOauthRefreshToken() != null && !config.getOauthRefreshToken().isEmpty()) {
+
+                OAuthTokens tokens = new OAuthTokens(
+                    config.getOauthAccessToken(),
+                    config.getOauthRefreshToken(),
+                    config.getOauthTokenExpiry());
+
+                if (vault.storeTokens(name, tokens)) {
+                    config.setOauthTokensInVault(true);
+                    config.setOauthAccessToken(null);
+                    config.setOauthRefreshToken(null);
+                    changed = true;
+                    logger.info("Migrated plaintext OAuth tokens for account '{}' into the vault", name);
+                } else {
+                    logger.warn("Could not migrate account '{}' into the vault; keeping plaintext "
+                        + "tokens in config", name);
+                }
+            }
+        }
+
+        return changed;
+    }
+
+    /**
+     * Renames the legacy {@code config.toml} to {@code config.toml.migrated} so the
+     * canonical JSON is never shadowed again. Best-effort: logs and continues on failure.
+     */
+    private static void retireLegacyTomlFile() {
+        Path retired = CONFIG_DIR.resolve("config.toml.migrated");
+        try {
+            Files.move(CONFIG_FILE, retired, StandardCopyOption.REPLACE_EXISTING);
+            logger.info("Retired legacy TOML config to {}", retired);
+        } catch (Exception e) {
+            logger.warn("Failed to retire legacy TOML config {}: {}", CONFIG_FILE, e.getMessage());
+        }
     }
 
     /**
@@ -367,12 +476,15 @@ public class ConfigLoader {
             data.put("smtp_password", config.getSmtpPassword());
         }
 
-        // OAuth tokens
-        if (config.getOauthAccessToken() != null) {
-            data.put("oauth_access_token", config.getOauthAccessToken());
-        }
-        if (config.getOauthRefreshToken() != null) {
-            data.put("oauth_refresh_token", config.getOauthRefreshToken());
+        // OAuth tokens. When tokens live in the vault, the access/refresh secrets are
+        // NEVER written to the config file — only the flag and the (non-secret) expiry.
+        if (!config.isOauthTokensInVault()) {
+            if (config.getOauthAccessToken() != null) {
+                data.put("oauth_access_token", config.getOauthAccessToken());
+            }
+            if (config.getOauthRefreshToken() != null) {
+                data.put("oauth_refresh_token", config.getOauthRefreshToken());
+            }
         }
         if (config.getOauthTokenExpiry() != null) {
             data.put("oauth_token_expiry", config.getOauthTokenExpiry().toString());
