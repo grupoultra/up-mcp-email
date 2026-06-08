@@ -49,7 +49,8 @@ public class SendEmail extends BaseTool {
             "in_reply_to", "string", "Message-ID of the email being replied to. Enables proper threading. (optional)",
             "references", "string", "Space-separated Message-IDs for the thread chain. Usually includes in_reply_to plus ancestors. (optional)",
             "include_signature", "boolean", "Include account signature in email (default: true)",
-            "from_address", "string", "Override From address. Use when sending from an alias authorized on the same SMTP server. Authentication uses account credentials. (optional)"
+            "from_address", "string", "Override From address. Use when sending from an alias authorized on the same SMTP server. Authentication uses account credentials. (optional)",
+            "include_history", "boolean", "When replying (in_reply_to set), append the quoted original message — the conversation history — below the new body. Defaults to true on replies, false otherwise."
         );
     }
 
@@ -77,6 +78,8 @@ public class SendEmail extends BaseTool {
         String references = getString(args, "references", null);
         boolean includeSignature = getBoolean(args, "include_signature", true);
         String fromAddress = getString(args, "from_address", null);
+        // History (quoted original) defaults on for replies, off for fresh emails.
+        boolean includeHistory = getBoolean(args, "include_history", inReplyTo != null && !inReplyTo.isEmpty());
 
         return context.emailClient(accountName).sendEmail(
             recipients, subject, body,
@@ -84,7 +87,7 @@ public class SendEmail extends BaseTool {
             bcc.isEmpty() ? null : bcc,
             attachments.isEmpty() ? null : attachments,
             inReplyTo, references, includeSignature,
-            fromAddress
+            fromAddress, includeHistory
         );
     }
 }

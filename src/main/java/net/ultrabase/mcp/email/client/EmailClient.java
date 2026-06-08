@@ -791,7 +791,7 @@ public class EmailClient implements IEmailClient {
     public CompletableFuture<JsonNode> sendEmail(List<String> recipients, String subject, String body,
                                                   List<String> cc, List<String> bcc, List<String> attachments,
                                                   String inReplyTo, String references, boolean includeSignature,
-                                                  String fromAddressOverride) {
+                                                  String fromAddressOverride, boolean includeHistory) {
         return CompletableFuture.supplyAsync(() -> {
             try {
                 Session session = getSmtpSession();
@@ -843,8 +843,13 @@ public class EmailClient implements IEmailClient {
                     message.setHeader("References", references);
                 }
 
-                // Compose body with signature and footer (returns HTML)
-                String htmlBody = composeEmailBody(body, includeSignature);
+                // Build the quoted original (history) when this is a reply and it was requested.
+                String quotedHistory = (includeHistory && inReplyTo != null && !inReplyTo.isEmpty())
+                    ? buildQuotedHistory(inReplyTo)
+                    : "";
+
+                // Compose body with signature, quoted history and footer (returns HTML)
+                String htmlBody = composeEmailBody(body, includeSignature, quotedHistory);
 
                 // Determine if we need multipart/related (embedded image)
                 boolean needsRelated = includeSignature && hasSignatureImage();
@@ -952,7 +957,7 @@ public class EmailClient implements IEmailClient {
      * @param includeSignature Whether to include account signature
      * @return Composed HTML body with signature and footer
      */
-    private String composeEmailBody(String body, boolean includeSignature) {
+    private String composeEmailBody(String body, boolean includeSignature, String quotedHistoryHtml) {
         // Convert body to HTML first
         String htmlBody = convertToHtml(body);
 
@@ -967,6 +972,11 @@ public class EmailClient implements IEmailClient {
             if (!signatureHtml.isEmpty()) {
                 finalHtml.append("\n<br><br>\n").append(signatureHtml);
             }
+        }
+
+        // Append the quoted original message (reply history) below the new content
+        if (quotedHistoryHtml != null && !quotedHistoryHtml.isEmpty()) {
+            finalHtml.append("\n<br>\n").append(quotedHistoryHtml);
         }
 
         // Add footer if enabled
@@ -1132,6 +1142,120 @@ public class EmailClient implements IEmailClient {
             "<td style=\"padding: 6px 12px 6px 0; border-bottom: 1px solid #ddd;\">");
 
         return html;
+    }
+
+    /**
+     * Fetches the message identified by {@code messageId} and renders it as an HTML quote
+     * block (attribution line + blockquote) to append under a reply. Returns an empty string
+     * if the original cannot be located or read, so a reply is never blocked by a missing
+     * original.
+     */
+    private String buildQuotedHistory(String messageId) {
+        try {
+            Store store = getImapStore();
+            Folder folder = findAllMailOrInbox(store);
+            if (folder == null) {
+                return "";
+            }
+            folder.open(Folder.READ_ONLY);
+            try {
+                Message[] found = folder.search(new MessageIDTerm(messageId));
+                if (found == null || found.length == 0) {
+                    logger.warn("[{}] include_history: original message {} not found",
+                        config.getAccountName(), messageId);
+                    return "";
+                }
+                Message original = found[found.length - 1];
+
+                String from = "";
+                Address[] fromAddrs = original.getFrom();
+                if (fromAddrs != null && fromAddrs.length > 0) {
+                    from = fromAddrs[0].toString();
+                }
+                Date sent = original.getSentDate();
+                String when = sent != null
+                    ? DateTimeFormatter.ofPattern("d 'de' MMMM 'de' yyyy, HH:mm",
+                            java.util.Locale.forLanguageTag("es"))
+                        .withZone(ZoneId.systemDefault())
+                        .format(sent.toInstant())
+                    : "";
+
+                String originalBody = extractTextBody(original);
+                String quotedInner;
+                if (originalBody == null || originalBody.isBlank()) {
+                    quotedInner = "";
+                } else if (isHtml(originalBody)) {
+                    quotedInner = originalBody;  // already HTML, keep formatting
+                } else {
+                    quotedInner = escapeHtml(originalBody).replace("\n", "<br>\n");
+                }
+
+                String attribution = when.isEmpty()
+                    ? escapeHtml(from) + " escribió:"
+                    : "El " + escapeHtml(when) + ", " + escapeHtml(from) + " escribió:";
+
+                return "<div class=\"" + quoteCssClass() + "\">\n" + attribution + "<br>\n"
+                    + "<blockquote style=\"margin:0 0 0 .8ex;border-left:1px solid #ccc;"
+                    + "padding-left:1ex;color:#555;\">\n"
+                    + quotedInner
+                    + "\n</blockquote>\n</div>\n";
+            } finally {
+                folder.close(false);
+            }
+        } catch (Exception e) {
+            logger.warn("[{}] include_history: could not build quoted history for {}: {}",
+                config.getAccountName(), messageId, e.getMessage());
+            return "";
+        }
+    }
+
+    /**
+     * Returns the Gmail "All Mail" folder (special-use {@code \All}) so both received and sent
+     * originals are searchable regardless of localized folder names, falling back to INBOX.
+     */
+    private Folder findAllMailOrInbox(Store store) throws MessagingException {
+        try {
+            for (Folder f : store.getDefaultFolder().list("*")) {
+                if ((f.getType() & Folder.HOLDS_MESSAGES) == 0) {
+                    continue;
+                }
+                if (f instanceof org.eclipse.angus.mail.imap.IMAPFolder) {
+                    String[] attrs = ((org.eclipse.angus.mail.imap.IMAPFolder) f).getAttributes();
+                    if (attrs != null) {
+                        for (String a : attrs) {
+                            if ("\\All".equalsIgnoreCase(a)) {
+                                return f;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("[{}] All Mail lookup failed: {}", config.getAccountName(), e.getMessage());
+        }
+        Folder inbox = store.getFolder("INBOX");
+        return inbox.exists() ? inbox : null;
+    }
+
+    private static String escapeHtml(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    /**
+     * CSS class for the reply quote block. {@code email_quote} is our own vendor-neutral
+     * marker (the concept the rest of the system reasons about); a vendor hint is appended
+     * only when it improves the recipient's rendering — Gmail collapses blocks tagged
+     * {@code gmail_quote} behind its "show trimmed content" toggle, and the class is inert
+     * everywhere else. Callers never see this; they only toggle include_history.
+     */
+    private String quoteCssClass() {
+        String host = config.getImapHost();
+        boolean gmailBacked = host != null && host.toLowerCase().contains("gmail");
+        return gmailBacked ? "email_quote gmail_quote" : "email_quote";
     }
 
     @Override
