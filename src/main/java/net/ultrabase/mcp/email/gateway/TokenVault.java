@@ -56,7 +56,10 @@ public class TokenVault {
      * Converts an account alias into a filesystem/secret-safe key fragment.
      */
     public static String safeName(String accountName) {
-        return accountName.replace("@", "_at_").replace(".", "_");
+        // Vault keys must satisfy the gateway's contract (EncryptedSecretStore.validateKey):
+        // ^[A-Z][A-Z0-9_]*$ — uppercase letters, digits and underscores only. Uppercase the
+        // alias and collapse any other character (@, ., -, …) to an underscore.
+        return accountName.toUpperCase().replaceAll("[^A-Z0-9]", "_");
     }
 
     private static String accessKey(String accountName) {

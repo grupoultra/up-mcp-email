@@ -131,7 +131,9 @@ public class SecretClient {
         try {
             String url = String.format("%s/secrets/%s/%s", gatewayUrl, providerId, key);
             HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-            conn.setRequestMethod("PUT");
+            // The gateway's SecretsServlet stores via POST (handleStoreSecret); it has no
+            // doPut handler, so PUT returns HTTP 405. POST returns 201 on success.
+            conn.setRequestMethod("POST");
             conn.setRequestProperty("Authorization", "Bearer " + apiToken);
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setDoOutput(true);

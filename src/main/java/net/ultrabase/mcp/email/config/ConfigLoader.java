@@ -152,8 +152,9 @@ public class ConfigLoader {
 
                 if (vault.storeTokens(name, tokens)) {
                     config.setOauthTokensInVault(true);
-                    config.setOauthAccessToken(null);
-                    config.setOauthRefreshToken(null);
+                    // Keep the tokens in memory so the account stays usable for the rest of
+                    // this run; accountToJson() already omits secrets from the config file
+                    // when oauth_tokens_in_vault=true, so they are not persisted in plaintext.
                     changed = true;
                     logger.info("Migrated plaintext OAuth tokens for account '{}' into the vault", name);
                 } else {
