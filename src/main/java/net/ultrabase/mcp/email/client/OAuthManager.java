@@ -67,6 +67,24 @@ public class OAuthManager {
      * @throws OAuthException if authorization fails
      */
     public static OAuthTokens authorize(String clientId, String clientSecret) throws OAuthException {
+        return authorize(clientId, clientSecret, null);
+    }
+
+    /**
+     * Same as {@link #authorize(String, String)} but pins the flow to a specific Google
+     * account. {@code expectedEmail} is passed to Google as {@code login_hint} so its account
+     * chooser pre-selects the right mailbox, and the account actually authorized is verified
+     * after the token exchange — a mismatch aborts (with a clear message) instead of silently
+     * storing a token for the wrong account. Pass {@code null} to skip hint and verification.
+     *
+     * @param clientId     OAuth client ID
+     * @param clientSecret OAuth client secret
+     * @param expectedEmail the mailbox this authorization is for (e.g. cesar@ratio.cl), or null
+     * @return OAuth tokens, guaranteed to belong to {@code expectedEmail} when it is non-null
+     * @throws OAuthException if authorization fails or the authorized account does not match
+     */
+    public static OAuthTokens authorize(String clientId, String clientSecret, String expectedEmail)
+            throws OAuthException {
         // Stop any lingering server from a previous call
         if (activeServer != null) {
             try {
@@ -105,17 +123,24 @@ public class OAuthManager {
                         return;
                     }
 
-                    // Success response
+                    // Success response — makes the target account explicit so a wrong-account
+                    // sign-in is visible immediately (and is verified server-side below).
+                    String accountBanner = (expectedEmail != null && !expectedEmail.isEmpty())
+                        ? "<p style=\"font-size:16px;\">Account: <strong>" + escapeHtml(expectedEmail) + "</strong></p>"
+                          + "<p style=\"color:#a00;\">If you signed in with a different Google account, "
+                          + "this authorization will be rejected — re-run and sign in as the account above.</p>"
+                        : "";
                     String successHtml = """
                         <!DOCTYPE html>
                         <html>
                         <head><title>Authorization Successful</title></head>
                         <body style="font-family: sans-serif; text-align: center; padding: 50px;">
                             <h1>Authorization Successful!</h1>
+                            %s
                             <p>You can close this window and return to your application.</p>
                         </body>
                         </html>
-                        """;
+                        """.formatted(accountBanner);
                     sendResponse(exchange, 200, successHtml);
                     authCodeFuture.complete(code);
 
@@ -139,6 +164,12 @@ public class OAuthManager {
                 URLEncoder.encode(SCOPES, StandardCharsets.UTF_8)
             );
 
+            // Pin Google's account chooser to the intended mailbox so the user does not pick
+            // the wrong Google account by mistake.
+            if (expectedEmail != null && !expectedEmail.isEmpty()) {
+                authUrl += "&login_hint=" + URLEncoder.encode(expectedEmail, StandardCharsets.UTF_8);
+            }
+
             // Open browser
             logger.info("Opening browser for OAuth authorization...");
             if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
@@ -154,7 +185,26 @@ public class OAuthManager {
             logger.info("Received authorization code");
 
             // Exchange code for tokens
-            return exchangeCodeForTokens(authCode, clientId, clientSecret);
+            OAuthTokens tokens = exchangeCodeForTokens(authCode, clientId, clientSecret);
+
+            // Verify the mailbox we just authorized matches the one being configured. Catches
+            // the "signed in with the wrong Google account" mistake before the token is ever
+            // stored against the wrong account.
+            if (expectedEmail != null && !expectedEmail.isEmpty()) {
+                String authorizedEmail = fetchAuthorizedEmail(tokens.accessToken());
+                if (authorizedEmail != null && !authorizedEmail.equalsIgnoreCase(expectedEmail)) {
+                    throw new OAuthException(String.format(
+                        "Account mismatch: you authorized '%s' but this account is configured for "
+                        + "'%s'. Re-run the authorization and sign in as %s.",
+                        authorizedEmail, expectedEmail, expectedEmail));
+                }
+                if (authorizedEmail == null) {
+                    logger.warn("Could not verify the authorized account for {} (Gmail profile "
+                        + "lookup failed); proceeding without account verification", expectedEmail);
+                }
+            }
+
+            return tokens;
 
         } catch (Exception e) {
             if (e instanceof OAuthException) {
@@ -377,6 +427,44 @@ public class OAuthManager {
             logger.debug("MX lookup failed for {}: {}", domain, e.getMessage());
         }
         return false;
+    }
+
+    /**
+     * Returns the email address the given access token authorizes, via the Gmail profile
+     * endpoint (covered by the mail.google.com scope), or null if it cannot be determined.
+     */
+    private static String fetchAuthorizedEmail(String accessToken) {
+        try {
+            HttpURLConnection conn = (HttpURLConnection)
+                new URL("https://gmail.googleapis.com/gmail/v1/users/me/profile").openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("Authorization", "Bearer " + accessToken);
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                logger.warn("Gmail profile lookup returned HTTP {}", code);
+                return null;
+            }
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    sb.append(line);
+                }
+                JsonNode json = objectMapper.readTree(sb.toString());
+                return json.has("emailAddress") ? json.get("emailAddress").asText() : null;
+            }
+        } catch (Exception e) {
+            logger.warn("Gmail profile lookup failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private static String escapeHtml(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("\"", "&quot;");
     }
 
     private static Map<String, String> parseQueryParams(String query) {

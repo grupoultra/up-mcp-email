@@ -127,8 +127,10 @@ public class AddEmailAccount extends BaseTool {
         String clientSecret = credentials[1];
 
         try {
-            // Run OAuth flow (opens browser)
-            OAuthManager.OAuthTokens tokens = OAuthManager.authorize(clientId, clientSecret);
+            // Run OAuth flow (opens browser), pinned to the mailbox being added so the user
+            // cannot authorize the wrong Google account by mistake.
+            OAuthManager.OAuthTokens tokens =
+                OAuthManager.authorize(clientId, clientSecret, emailAddress);
 
             // Try to store tokens securely via Secret Management
             boolean tokensStoredSecurely = storeOAuthTokens(accountName, tokens);

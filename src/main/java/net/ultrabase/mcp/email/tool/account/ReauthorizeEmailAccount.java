@@ -91,8 +91,10 @@ public class ReauthorizeEmailAccount extends BaseTool {
             String clientSecret = credentials[1];
 
             try {
-                // Run OAuth flow (opens browser)
-                OAuthManager.OAuthTokens tokens = OAuthManager.authorize(clientId, clientSecret);
+                // Run OAuth flow (opens browser), pinned to this account's mailbox so the user
+                // cannot authorize the wrong Google account by mistake.
+                OAuthManager.OAuthTokens tokens =
+                    OAuthManager.authorize(clientId, clientSecret, config.getEmailAddress());
 
                 // Try to store tokens securely via Secret Management
                 boolean tokensStoredSecurely = storeOAuthTokens(accountName, tokens);
