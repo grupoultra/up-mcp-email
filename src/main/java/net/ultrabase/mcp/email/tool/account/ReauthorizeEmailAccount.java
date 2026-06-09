@@ -96,20 +96,10 @@ public class ReauthorizeEmailAccount extends BaseTool {
                 OAuthManager.OAuthTokens tokens =
                     OAuthManager.authorize(clientId, clientSecret, config.getEmailAddress());
 
-                // Try to store tokens securely via Secret Management
+                // Persist to the vault (when available), then apply the new tokens to the LIVE
+                // config so the running client uses them without a restart — see applyTokensToConfig.
                 boolean tokensStoredSecurely = storeOAuthTokens(accountName, tokens);
-
-                // Update account config with new tokens
-                if (!tokensStoredSecurely) {
-                    config.setOauthAccessToken(tokens.accessToken());
-                    config.setOauthRefreshToken(tokens.refreshToken());
-                }
-                config.setOauthTokenExpiry(tokens.expiry());
-                config.setOauthTokensInVault(tokensStoredSecurely);
-
-                // Re-add to invalidate cached client (addAccount overwrites and clears cache)
-                context.accountRegistry().addAccount(config);
-                context.accountRegistry().save();
+                applyTokensToConfig(config, tokens, tokensStoredSecurely);
 
                 ObjectNode result = objectMapper.createObjectNode();
                 result.put("success", true);
@@ -128,6 +118,41 @@ public class ReauthorizeEmailAccount extends BaseTool {
                 throw new RuntimeException("OAuth re-authorization failed: " + e.getMessage(), e);
             }
         });
+    }
+
+    /**
+     * Applies the freshly authorized tokens to the live, in-memory account config and invalidates
+     * the cached client so the running client uses them immediately — no restart required.
+     *
+     * <p><b>Why the in-memory update is mandatory.</b> The running {@code EmailClient} reads the
+     * access/refresh token from this {@link AccountConfig} object — not from the vault — and
+     * decides whether to refresh by the in-memory {@code oauthTokenExpiry}. Writing only the vault
+     * and the new (future) expiry while leaving the <em>stale</em> access token in memory makes the
+     * client treat the dead token as valid: the future expiry suppresses the refresh-on-use path,
+     * so authentication keeps failing until a restart re-hydrates the config from the vault (via
+     * {@code ConfigLoader.reconcileVault}). Updating both secrets here closes that gap. When the
+     * tokens are vault-backed, {@code ConfigLoader.accountToJson()} omits the secrets from
+     * {@code config.json}, so the in-memory update never leaks a token to disk.
+     *
+     * <p>The {@code tokensStoredSecurely} decision is passed in rather than re-derived so this
+     * (the logic that carries the regression) stays a pure, synchronously testable seam — no
+     * Secret Management or worker-thread interaction required.
+     *
+     * @param config               the live config to mutate
+     * @param tokens               the freshly authorized tokens
+     * @param tokensStoredSecurely whether {@link #storeOAuthTokens} persisted them to the vault
+     */
+    void applyTokensToConfig(AccountConfig config, OAuthManager.OAuthTokens tokens,
+                             boolean tokensStoredSecurely) {
+        // Always refresh the in-memory tokens — both secrets, not just the expiry.
+        config.setOauthAccessToken(tokens.accessToken());
+        config.setOauthRefreshToken(tokens.refreshToken());
+        config.setOauthTokenExpiry(tokens.expiry());
+        config.setOauthTokensInVault(tokensStoredSecurely);
+
+        // Re-add to invalidate cached client (addAccount overwrites and clears cache)
+        context.accountRegistry().addAccount(config);
+        context.accountRegistry().save();
     }
 
     private boolean storeOAuthTokens(String accountName, OAuthManager.OAuthTokens tokens) {
