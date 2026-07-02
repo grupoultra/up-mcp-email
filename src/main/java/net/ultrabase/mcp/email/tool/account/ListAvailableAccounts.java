@@ -65,6 +65,12 @@ public class ListAvailableAccounts extends BaseTool {
                 accountNode.put("is_default", masked.isDefault());
                 accountNode.put("permissions", ConfigLoader.formatPermissions(masked.getPermissions()));
                 accountNode.put("include_in_status", masked.isIncludeInStatus());
+                if (masked.isOauthReauthRequired()) {
+                    // Surface terminal OAuth failure loudly: this account cannot operate until
+                    // reauthorize_email_account is run.
+                    accountNode.put("reauth_required", true);
+                    accountNode.put("reauth_since", String.valueOf(masked.getOauthReauthSince()));
+                }
 
                 accountsArray.add(accountNode);
             }

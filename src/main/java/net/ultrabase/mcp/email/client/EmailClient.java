@@ -201,6 +201,13 @@ public class EmailClient implements IEmailClient {
         if (!config.isOAuth2()) {
             return;
         }
+        // Terminal refresh failure (invalid_grant): retrying every sweep cannot cure it and
+        // floods the log — the account needs an interactive re-authorization. Skip until then.
+        if (config.isOauthReauthRequired()) {
+            logger.debug("[{}] Keep-alive: skipped — account requires re-authorization (since {})",
+                config.getAccountName(), config.getOauthReauthSince());
+            return;
+        }
         Instant expiry = config.getOauthTokenExpiry();
         if (expiry == null) {
             return;
@@ -221,6 +228,16 @@ public class EmailClient implements IEmailClient {
 
     private String refreshOAuthToken() {
         long startTime = System.currentTimeMillis();
+
+        // Fail fast on a known-dead refresh token: give the caller the actionable message
+        // instead of burning a round-trip to Google that will 400 with the same invalid_grant.
+        if (config.isOauthReauthRequired()) {
+            throw new IllegalStateException(String.format(
+                "Account '%s' requires re-authorization (refresh token expired or revoked since %s). "
+                + "Run reauthorize_email_account with account_name=\"%s\".",
+                config.getAccountName(), config.getOauthReauthSince(), config.getAccountName()));
+        }
+
         logger.info("[{}] Starting OAuth token refresh...", config.getAccountName());
 
         String refreshToken = config.getOauthRefreshToken();
@@ -270,8 +287,27 @@ public class EmailClient implements IEmailClient {
             long elapsed = System.currentTimeMillis() - startTime;
             logger.error("[{}] Failed to refresh OAuth token after {}ms: {}",
                 config.getAccountName(), elapsed, e.getMessage());
+            if (isTerminalGrantFailure(e)) {
+                // invalid_grant is terminal: the refresh token itself is dead (expired 7-day
+                // testing-mode token, revoked grant, etc.). Flag the account so the keep-alive
+                // stops hammering, tools fail with an actionable message, and the user gets ONE
+                // loud desktop notification instead of a week of silent 10-minute failures.
+                boolean firstDetection = !config.isOauthReauthRequired();
+                config.markOauthReauthRequired();
+                logger.error("[{}] Refresh token is expired or revoked — account flagged: "
+                    + "re-authorization required (reauthorize_email_account)", config.getAccountName());
+                if (firstDetection) {
+                    ReauthNotifier.notifyReauthRequired(config.getAccountName(), config.getEmailAddress());
+                }
+            }
             throw new IllegalStateException("OAuth token refresh failed: " + e.getMessage(), e);
         }
+    }
+
+    /** True when the refresh failure is terminal (dead refresh token), not transient. */
+    private static boolean isTerminalGrantFailure(OAuthManager.OAuthException e) {
+        String msg = e.getMessage();
+        return msg != null && msg.contains("invalid_grant");
     }
 
     private Folder openFolder(String mailboxName, int mode) throws MessagingException {

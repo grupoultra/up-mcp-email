@@ -149,6 +149,9 @@ public class ReauthorizeEmailAccount extends BaseTool {
         config.setOauthRefreshToken(tokens.refreshToken());
         config.setOauthTokenExpiry(tokens.expiry());
         config.setOauthTokensInVault(tokensStoredSecurely);
+        // The account has a fresh grant: lift the terminal-failure flag so the keep-alive
+        // sweep resumes and tools stop failing fast.
+        config.clearOauthReauthRequired();
 
         // Re-add to invalidate cached client (addAccount overwrites and clears cache)
         context.accountRegistry().addAccount(config);

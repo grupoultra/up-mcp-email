@@ -64,6 +64,14 @@ public class AccountConfig {
     private Instant oauthTokenExpiry;
     private boolean oauthTokensInVault = false;
 
+    // Runtime-only (never persisted): the refresh token was rejected by the provider with a
+    // terminal error (invalid_grant: expired/revoked). Retrying cannot cure it — the account
+    // needs an interactive re-authorization. Set by EmailClient on refresh failure; cleared by
+    // ReauthorizeEmailAccount. Keeps the keep-alive sweep from hammering a dead token and lets
+    // status tools surface the condition instead of failing silently every 10 minutes.
+    private volatile boolean oauthReauthRequired = false;
+    private volatile Instant oauthReauthSince = null;
+
     // Permissions (default: all allowed)
     private Set<Permission> permissions = EnumSet.allOf(Permission.class);
 
@@ -245,6 +253,28 @@ public class AccountConfig {
         this.oauthTokensInVault = oauthTokensInVault;
     }
 
+    public boolean isOauthReauthRequired() {
+        return oauthReauthRequired;
+    }
+
+    public Instant getOauthReauthSince() {
+        return oauthReauthSince;
+    }
+
+    /** Marks the account as needing interactive re-authorization (terminal refresh failure). */
+    public void markOauthReauthRequired() {
+        this.oauthReauthRequired = true;
+        if (this.oauthReauthSince == null) {
+            this.oauthReauthSince = Instant.now();
+        }
+    }
+
+    /** Clears the re-authorization flag (called after a successful reauthorize). */
+    public void clearOauthReauthRequired() {
+        this.oauthReauthRequired = false;
+        this.oauthReauthSince = null;
+    }
+
     public Set<Permission> getPermissions() {
         return permissions;
     }
@@ -344,6 +374,8 @@ public class AccountConfig {
         masked.oauthRefreshToken = this.oauthRefreshToken != null ? "****" : null;
         masked.oauthTokenExpiry = this.oauthTokenExpiry;
         masked.oauthTokensInVault = this.oauthTokensInVault;
+        masked.oauthReauthRequired = this.oauthReauthRequired;
+        masked.oauthReauthSince = this.oauthReauthSince;
         masked.permissions = this.permissions;
         masked.includeInStatus = this.includeInStatus;
         masked.statusCacheTtl = this.statusCacheTtl;

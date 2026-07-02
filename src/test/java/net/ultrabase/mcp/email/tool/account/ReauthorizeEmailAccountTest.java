@@ -90,6 +90,26 @@ class ReauthorizeEmailAccountTest {
     }
 
     @Test
+    void reauthClearsTerminalFailureFlag() {
+        // A terminal refresh failure (invalid_grant) flags the account; a successful
+        // reauthorize must lift the flag so the keep-alive sweep resumes.
+        AccountConfig config = staleVaultBackedConfig();
+        config.markOauthReauthRequired();
+        assertTrue(config.isOauthReauthRequired());
+        assertNotNull(config.getOauthReauthSince());
+
+        RecordingRegistry registry = new RecordingRegistry();
+        ReauthorizeEmailAccount tool = new ReauthorizeEmailAccount(new ToolContext(registry));
+        java.time.Instant future = java.time.Instant.now().plusSeconds(3600);
+        tool.applyTokensToConfig(config,
+            new OAuthManager.OAuthTokens("NEW_access", "NEW_refresh", future), true);
+
+        assertFalse(config.isOauthReauthRequired(),
+            "reauthorize must clear the terminal-failure flag");
+        assertNull(config.getOauthReauthSince());
+    }
+
+    @Test
     void fallbackPath_alsoRefreshesInMemoryTokens() {
         AccountConfig config = staleVaultBackedConfig();
         RecordingRegistry registry = new RecordingRegistry();
